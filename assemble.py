@@ -26,6 +26,7 @@ EXCLUDE_FILES = {
     'disassemble.py',
     'response.txt',
     'project_prompt.txt',
+    'code_check.txt',
     'README.md',
     # 添加其他你想要排除的文件
 }
