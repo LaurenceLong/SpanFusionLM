@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .modules.decoder import SpanDecoder, sample_from_logits
+from .modules.decoder import SpanDecoder
 from .modules.encoder import SpanEncoder
 from .modules.gate_net import GateNet
 from .modules.proj_head import ProjectionHead
