@@ -30,40 +30,40 @@ def parse_args():
     parser.add_argument("--dataset_config_name", type=str, default="wikitext-103-raw-v1", help="Dataset config")
     parser.add_argument("--train_split", type=str, default="train", help="Train split")
     parser.add_argument("--eval_split", type=str, default="test", help="Eval split")
-    parser.add_argument("--max_seq_length", type=int, default=1024, help="Max sequence length")
+    parser.add_argument("--max_seq_length", type=int, default=512, help="Max sequence length")
 
     # Model args
     parser.add_argument("--tokenizer_name", type=str, default="gpt2", help="Tokenizer name")
-    parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size")
-    parser.add_argument("--intermediate_size", type=int, default=3072, help="Intermediate size")
-    parser.add_argument("--num_decoder_layers", type=int, default=12, help="Decoder layers")
-    parser.add_argument("--num_encoder_layers", type=int, default=4, help="Encoder layers")
-    parser.add_argument("--num_attention_heads", type=int, default=12, help="Attention heads")
+    parser.add_argument("--hidden_size", type=int, default=512, help="Hidden size")
+    parser.add_argument("--intermediate_size", type=int, default=2048, help="Intermediate size")
+    parser.add_argument("--num_decoder_layers", type=int, default=6, help="Decoder layers")
+    parser.add_argument("--num_encoder_layers", type=int, default=3, help="Encoder layers")
+    parser.add_argument("--num_attention_heads", type=int, default=8, help="Attention heads")
     parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta")
-    parser.add_argument("--g_max", type=int, default=8, help="Max GateNet steps")
-    parser.add_argument("--span_lengths_str", type=str, default="8,16,24,32", help="Span lengths")
+    parser.add_argument("--g_max", type=int, default=4, help="Max GateNet steps")
+    parser.add_argument("--span_lengths_str", type=str, default="8,16", help="Span lengths")
 
     # Training args
     parser.add_argument("--output_dir", type=str, default="./spanfusionlm_checkpoint", help="Output directory")
-    parser.add_argument("--learning_rate", type=float, default=3e-4, help="Learning rate")
-    parser.add_argument("--weight_decay", type=float, default=0.1, help="Weight decay")
+    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
     parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2")
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--beta_cost_g", type=float, default=0.02, help="E[g] cost coefficient")
+    parser.add_argument("--grad_clip", type=float, default=0.5, help="Gradient clipping")
+    parser.add_argument("--beta_cost_g", type=float, default=0.01, help="E[g] cost coefficient")
     parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision")
 
-    parser.add_argument("--batch_size_per_device", type=int, default=4, help="Batch size per device")
-    parser.add_argument("--gradient_accumulation_steps", type=int, default=8, help="Gradient accumulation")
+    parser.add_argument("--batch_size_per_device", type=int, default=2, help="Batch size per device")
+    parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Training epochs")
-    parser.add_argument("--max_train_steps", type=int, default=None, help="Max training steps")
-    parser.add_argument("--lr_scheduler_type", type=str, default="cosine", help="LR scheduler")
-    parser.add_argument("--warmup_steps", type=int, default=1000, help="Warmup steps")
+    parser.add_argument("--max_train_steps", type=int, default=1000, help="Max training steps")
+    parser.add_argument("--lr_scheduler_type", type=str, default="linear", help="LR scheduler")
+    parser.add_argument("--warmup_steps", type=int, default=100, help="Warmup steps")
 
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Eval steps")
-    parser.add_argument("--logging_steps", type=int, default=100, help="Logging steps")
-    parser.add_argument("--save_steps", type=int, default=1000, help="Save steps")
+    parser.add_argument("--eval_steps", type=int, default=200, help="Eval steps")
+    parser.add_argument("--logging_steps", type=int, default=50, help="Logging steps")
+    parser.add_argument("--save_steps", type=int, default=500, help="Save steps")
 
     # W&B args
     parser.add_argument("--wandb_project", type=str, default="SpanFusionLM", help="W&B project")
@@ -80,21 +80,19 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
 
     for sample in batch_samples:
         text = sample.get("text", "")
-        if not isinstance(text, str) or len(text.strip()) < 10:  # 过滤太短的文本
+        if not isinstance(text, str) or len(text.strip()) < 50:
             continue
 
-        # 分词
-        tokens = tokenizer.encode(text, add_special_tokens=False, max_length=max_seq_len + fixed_K_value + 100, truncation=True)
+        tokens = tokenizer.encode(text, add_special_tokens=False, max_length=max_seq_len + fixed_K_value + 50, truncation=True)
 
-        if len(tokens) < fixed_K_value + 10:  # 确保有足够的token
+        if len(tokens) < fixed_K_value + 20:
             continue
 
-        # 随机选择分割点
         max_prompt_len = min(max_seq_len - fixed_K_value, len(tokens) - fixed_K_value)
-        if max_prompt_len < 10:
+        if max_prompt_len < 20:
             continue
 
-        prompt_len = random.randint(10, max_prompt_len)
+        prompt_len = random.randint(20, max_prompt_len)
 
         seq_prompt_toks = tokens[:prompt_len]
         gold_span_toks = tokens[prompt_len:prompt_len + fixed_K_value]
@@ -108,7 +106,6 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
     if not seq_prompts_list:
         return None
 
-    # 填充序列
     padded_seq_prompts = torch.nn.utils.rnn.pad_sequence(
         seq_prompts_list, batch_first=True, padding_value=pad_token_id
     )
@@ -118,68 +115,77 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
 
     return padded_seq_prompts, padded_gold_spans
 
-@torch.no_grad()
-def evaluate(model, dataloader, accelerator, config, args):
-    """评估函数"""
-    model.eval()
-    total_ar_loss = 0.0
-    total_samples = 0
+def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accelerator):
+    """计算所有损失项"""
+    try:
+        # 前向传播
+        student_out = model(
+            seq_prompt,
+            current_K,
+            gold_span=gold_span,
+            compute_teacher_latent=True
+        )
 
-    eval_steps = 50  # 限制评估步数以节省时间
-    current_step = 0
+        unwrapped_model = accelerator.unwrap_model(model)
+        losses = {}
 
-    for step, batch_samples in enumerate(dataloader):
-        if current_step >= eval_steps:
-            break
-
-        collated_data = collate_fn(batch_samples, config.tokenizer, 16, args.max_seq_length, config.pad_token_id)
-        if collated_data is None:
-            continue
-
-        seq_prompt, gold_span = collated_data
-        seq_prompt = seq_prompt.to(accelerator.device)
-        gold_span = gold_span.to(accelerator.device)
-
-        # AR损失计算
+        # 1. L_AR - 自回归损失
         gold_full_seq = torch.cat([seq_prompt, gold_span], dim=1)
-        if gold_full_seq.shape[1] > config.max_position_embeddings:
-            gold_full_seq = gold_full_seq[:, :config.max_position_embeddings]
+        if gold_full_seq.shape[1] > model_config.max_position_embeddings:
+            gold_full_seq = gold_full_seq[:, :model_config.max_position_embeddings]
 
         gold_input_ids = gold_full_seq[:, :-1]
         gold_target_ids = gold_full_seq[:, 1:]
 
-        if gold_input_ids.shape[1] == 0:
-            continue
+        if gold_input_ids.shape[1] > 0:
+            # 简化的AR损失计算
+            embeddings = unwrapped_model.token_emb(gold_input_ids)
+            batch_size_ar, ar_seq_len = gold_input_ids.shape
+            ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
 
-        unwrapped_model = accelerator.unwrap_model(model)
-        embeddings = unwrapped_model.token_emb(gold_input_ids)
+            h_gold_ar, _ = unwrapped_model.decoder(
+                hidden_states=embeddings,
+                position_ids=ar_pos_ids,
+                past_key_values=None,
+                use_cache=False
+            )
+            logits_ar = unwrapped_model.proj_head(h_gold_ar)
+            losses['ar'] = F.cross_entropy(
+                logits_ar.reshape(-1, model_config.vocab_size),
+                gold_target_ids.reshape(-1),
+                ignore_index=model_config.pad_token_id
+            )
+        else:
+            losses['ar'] = torch.tensor(0.0, device=accelerator.device)
 
-        batch_size, ar_seq_len = gold_input_ids.shape
-        ar_position_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size, -1)
+        # 2. L_latent - 潜在空间损失
+        if unwrapped_model.z_pred_for_loss is not None and unwrapped_model.z_teacher_for_loss is not None:
+            losses['latent'] = F.mse_loss(unwrapped_model.z_pred_for_loss, unwrapped_model.z_teacher_for_loss)
+        else:
+            losses['latent'] = torch.tensor(0.0, device=accelerator.device)
 
-        h_gold_ar, _ = unwrapped_model.decoder(
-            hidden_states=embeddings,
-            position_ids=ar_position_ids,
-            past_key_values=None,
-            use_cache=False
-        )
-        logits_ar = unwrapped_model.proj_head(h_gold_ar)
+        # 3. L_token - token预测损失
+        if unwrapped_model.logits_span_for_loss is not None:
+            losses['token'] = F.cross_entropy(
+                unwrapped_model.logits_span_for_loss.reshape(-1, model_config.vocab_size),
+                gold_span.reshape(-1),
+                ignore_index=model_config.pad_token_id
+            )
+        else:
+            losses['token'] = torch.tensor(0.0, device=accelerator.device)
 
-        loss_ar = F.cross_entropy(
-            logits_ar.reshape(-1, config.vocab_size),
-            gold_target_ids.reshape(-1),
-            ignore_index=config.pad_token_id
-        )
+        # 4. E[g] - 期望步数损失
+        if student_out['p_g'] is not None:
+            g_range = torch.arange(1, model_config.g_max + 1, device=accelerator.device, dtype=torch.float)
+            losses['exp_g'] = (student_out['p_g'] * g_range).sum(dim=-1).mean()
+        else:
+            losses['exp_g'] = torch.tensor(0.0, device=accelerator.device)
 
-        total_ar_loss += loss_ar.item() * gold_input_ids.shape[0]
-        total_samples += gold_input_ids.shape[0]
-        current_step += 1
+        return losses, True
 
-    avg_ar_loss = total_ar_loss / total_samples if total_samples > 0 else 0.0
-    perplexity = math.exp(min(avg_ar_loss, 10))  # 限制perplexity计算
-
-    model.train()
-    return avg_ar_loss, perplexity
+    except Exception as e:
+        logger.error(f"Error in loss computation: {e}")
+        return None, False
 
 def main():
     args = parse_args()
@@ -239,15 +245,10 @@ def main():
     raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
 
     train_dataset = raw_datasets[args.train_split]
-    eval_dataset = raw_datasets[args.eval_split]
 
     # DataLoader包装器
     def train_collate_wrapper(batch_samples):
         current_K = random.choice(args.span_lengths)
-        return collate_fn(batch_samples, tokenizer, current_K, args.max_seq_length, model_config.pad_token_id)
-
-    def eval_collate_wrapper(batch_samples):
-        current_K = 16  # 固定K用于评估
         return collate_fn(batch_samples, tokenizer, current_K, args.max_seq_length, model_config.pad_token_id)
 
     train_dataloader = DataLoader(
@@ -256,11 +257,6 @@ def main():
         shuffle=True,
         collate_fn=train_collate_wrapper,
         drop_last=True
-    )
-    eval_dataloader = DataLoader(
-        eval_dataset,
-        batch_size=args.batch_size_per_device,
-        collate_fn=eval_collate_wrapper
     )
 
     # 学习率调度器
@@ -276,21 +272,19 @@ def main():
     )
 
     # Accelerator准备
-    model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
-        model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
+    model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_dataloader, lr_scheduler
     )
 
     logger.info("***** Running training *****")
-    logger.info(f"  Num examples = {len(train_dataset)}")
-    logger.info(f"  Num Epochs = {args.num_train_epochs}")
-    logger.info(f"  Batch size per device = {args.batch_size_per_device}")
-    logger.info(f"  Total train batch size = {args.batch_size_per_device * accelerator.num_processes * args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
     completed_steps = 0
+    skip_count = 0
 
     model.train()
+
     for epoch in range(args.num_train_epochs):
         for step, batch_data in enumerate(train_dataloader):
             if completed_steps >= args.max_train_steps:
@@ -302,142 +296,81 @@ def main():
             seq_prompt, gold_span = batch_data
             current_K = gold_span.shape[1]
 
+            # 使用accelerator的accumulate上下文管理器
             with accelerator.accumulate(model):
-                try:
-                    # 前向传播
-                    student_out = model(
-                        seq_prompt,
-                        current_K,
-                        gold_span=gold_span,
-                        compute_teacher_latent=True
-                    )
+                # 计算损失
+                loss_result, success = compute_losses(
+                    model, seq_prompt, gold_span, current_K, model_config, accelerator
+                )
 
-                    unwrapped_model = accelerator.unwrap_model(model)
+                if not success or loss_result is None:
+                    skip_count += 1
+                    if skip_count % 10 == 0:
+                        logger.warning(f"Skipped {skip_count} steps due to errors")
+                    continue
 
-                    # 计算各项损失
-                    losses = {}
+                losses = loss_result
 
-                    # 1. L_AR
-                    gold_full_seq = torch.cat([seq_prompt, gold_span], dim=1)
-                    if gold_full_seq.shape[1] > model_config.max_position_embeddings:
-                        gold_full_seq = gold_full_seq[:, :model_config.max_position_embeddings]
+                # 总损失计算
+                total_loss = (
+                    0.3 * losses['ar'] +
+                    0.3 * losses['latent'] +
+                    0.3 * losses['token'] +
+                    args.beta_cost_g * losses['exp_g']
+                )
 
-                    gold_input_ids = gold_full_seq[:, :-1]
-                    gold_target_ids = gold_full_seq[:, 1:]
+                # 检查损失有效性
+                if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss.item() > 50:
+                    skip_count += 1
+                    logger.warning(f"Invalid loss detected: {total_loss}, skipping step")
+                    continue
 
-                    if gold_input_ids.shape[1] > 0:
-                        embeddings = unwrapped_model.token_emb(gold_input_ids)
-                        batch_size_ar, ar_seq_len = gold_input_ids.shape
-                        ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
+                # 反向传播
+                accelerator.backward(total_loss)
 
-                        h_gold_ar, _ = unwrapped_model.decoder(
-                            embeddings,
-                            position_ids=ar_pos_ids,
-                            past_key_values=None,
-                            use_cache=False
-                        )
-                        logits_ar = unwrapped_model.proj_head(h_gold_ar)
-                        losses['ar'] = F.cross_entropy(
-                            logits_ar.reshape(-1, model_config.vocab_size),
-                            gold_target_ids.reshape(-1),
-                            ignore_index=model_config.pad_token_id
-                        )
-                    else:
-                        losses['ar'] = torch.tensor(0.0, device=accelerator.device)
-
-                    # 2. L_latent
-                    if unwrapped_model.z_pred_for_loss is not None and unwrapped_model.z_teacher_for_loss is not None:
-                        losses['latent'] = F.mse_loss(unwrapped_model.z_pred_for_loss, unwrapped_model.z_teacher_for_loss)
-                    else:
-                        losses['latent'] = torch.tensor(0.0, device=accelerator.device)
-
-                    # 3. L_token
-                    if unwrapped_model.logits_span_for_loss is not None:
-                        losses['token'] = F.cross_entropy(
-                            unwrapped_model.logits_span_for_loss.reshape(-1, model_config.vocab_size),
-                            gold_span.reshape(-1),
-                            ignore_index=model_config.pad_token_id
-                        )
-                    else:
-                        losses['token'] = torch.tensor(0.0, device=accelerator.device)
-
-                    # 4. E[g]
-                    if student_out['p_g'] is not None:
-                        g_range = torch.arange(1, model_config.g_max + 1, device=accelerator.device, dtype=torch.float)
-                        losses['exp_g'] = (student_out['p_g'] * g_range).sum(dim=-1).mean()
-                    else:
-                        losses['exp_g'] = torch.tensor(0.0, device=accelerator.device)
-
-                    # 总损失（调整权重）
-                    total_loss = (losses['ar'] +
-                                  0.3 * losses['latent'] +
-                                  0.5 * losses['token'] +
-                                  args.beta_cost_g * losses['exp_g'])
-
-                    # 检查损失有效性
-                    if torch.isnan(total_loss) or torch.isinf(total_loss):
-                        logger.warning(f"Invalid loss detected: {total_loss}, skipping step")
-                        continue
-
-                    accelerator.backward(total_loss)
-
+                # 只有在accumulate步骤完成时才进行优化步骤
+                if accelerator.sync_gradients:
                     # 梯度裁剪
                     if args.grad_clip > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
+                    # 优化器步骤
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
-                except Exception as e:
-                    logger.error(f"Error in training step {completed_steps}: {e}")
-                    optimizer.zero_grad()
-                    continue
+                    # 更新计数器
+                    completed_steps += 1
+                    progress_bar.update(1)
 
-            if accelerator.sync_gradients:
-                progress_bar.update(1)
-                completed_steps += 1
-
-                # 日志记录
-                if completed_steps % args.logging_steps == 0:
-                    loss_log = {
-                        "train_loss": total_loss.item(),
-                        "lr": lr_scheduler.get_last_lr()[0],
-                        "loss_ar": losses['ar'].item(),
-                        "loss_latent": losses['latent'].item(),
-                        "loss_token": losses['token'].item(),
-                        "exp_g": losses['exp_g'].item(),
-                        "epoch": epoch,
-                        "step": completed_steps,
-                    }
-
-                    if accelerator.is_main_process and not args.disable_wandb:
-                        wandb.log(loss_log)
-                    logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR={losses['ar'].item():.4f}")
-
-                # 评估
-                if completed_steps % args.eval_steps == 0:
-                    try:
-                        avg_ar_loss, perplexity = evaluate(model, eval_dataloader, accelerator, model_config, args)
-                        eval_log = {"eval_ar_loss": avg_ar_loss, "eval_perplexity": perplexity}
+                    # 日志记录
+                    if completed_steps % args.logging_steps == 0:
+                        loss_log = {
+                            "train_loss": total_loss.item(),
+                            "lr": lr_scheduler.get_last_lr()[0],
+                            "loss_ar": losses['ar'].item(),
+                            "loss_latent": losses['latent'].item(),
+                            "loss_token": losses['token'].item(),
+                            "exp_g": losses['exp_g'].item(),
+                            "step": completed_steps,
+                            "skip_count": skip_count,
+                        }
 
                         if accelerator.is_main_process and not args.disable_wandb:
-                            wandb.log(eval_log)
-                        logger.info(f"Eval at step {completed_steps}: Loss={avg_ar_loss:.4f}, PPL={perplexity:.2f}")
-                    except Exception as e:
-                        logger.error(f"Evaluation failed: {e}")
+                            wandb.log(loss_log)
+                        logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR={losses['ar'].item():.4f}, Token={losses['token'].item():.4f}")
 
-                # 保存检查点
-                if completed_steps % args.save_steps == 0:
-                    if accelerator.is_main_process:
-                        save_path = Path(args.output_dir) / f"checkpoint-{completed_steps}"
-                        save_path.mkdir(parents=True, exist_ok=True)
+                    # 保存检查点
+                    if completed_steps % args.save_steps == 0:
+                        if accelerator.is_main_process:
+                            save_path = Path(args.output_dir) / f"checkpoint-{completed_steps}"
+                            save_path.mkdir(parents=True, exist_ok=True)
 
-                        unwrapped_model_to_save = accelerator.unwrap_model(model)
-                        torch.save(unwrapped_model_to_save.state_dict(), save_path / "model.pt")
-                        tokenizer.save_pretrained(str(save_path))
-                        unwrapped_model_to_save.config.save_pretrained(str(save_path))
-                        logger.info(f"Checkpoint saved to {save_path}")
+                            unwrapped_model_to_save = accelerator.unwrap_model(model)
+                            torch.save(unwrapped_model_to_save.state_dict(), save_path / "model.pt")
+                            tokenizer.save_pretrained(str(save_path))
+                            unwrapped_model_to_save.config.save_pretrained(str(save_path))
+                            logger.info(f"Checkpoint saved to {save_path}")
 
             if completed_steps >= args.max_train_steps:
                 break
@@ -455,7 +388,7 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process and not args.disable_wandb:
         wandb.finish()
-    logger.info("Training complete.")
+    logger.info(f"Training complete. Total skipped steps: {skip_count}")
 
 if __name__ == "__main__":
     main()

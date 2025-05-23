@@ -28,18 +28,16 @@ def top_p_logits_processor(logits: torch.Tensor, top_p: float):
     return logits
 
 def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 0.9):
-    """改进的采样函数，更好的数值稳定性"""
+    """改进的采样函数"""
     logits = logits / max(temperature, 1e-8)
 
     if top_p < 1.0:
         logits = top_p_logits_processor(logits, top_p=top_p)
 
-    # 数值稳定性处理
     logits = torch.clamp(logits, min=-50, max=50)
     probs = torch.softmax(logits, dim=-1)
 
-    # 检查数值有效性
-    if torch.isnan(probs).any() or torch.isinf(probs).any() or torch.sum(probs, dim=-1).min() <= 0:
+    if torch.isnan(probs).any() or torch.isinf(probs).any():
         return torch.argmax(logits, dim=-1)
 
     try:
@@ -75,7 +73,6 @@ class SpanFusionLMConfig:
         if self.vocab_size is None or self.vocab_size == 32000:
             self.vocab_size = len(self.tokenizer)
 
-        # 设置特殊token ID
         if hasattr(self.tokenizer, 'additional_special_tokens') and '[PRED]' in self.tokenizer.additional_special_tokens:
             self.pred_token_id = self.tokenizer.additional_special_tokens_ids[
                 self.tokenizer.additional_special_tokens.index('[PRED]')
@@ -130,13 +127,12 @@ class SpanFusionLM(nn.Module):
         self.logits_span_for_loss = None
 
     def _calc_entropy(self, logits: torch.Tensor):
-        """计算熵，增强数值稳定性"""
-        # 数值稳定性处理
+        """计算熵"""
         logits = torch.clamp(logits, min=-50, max=50)
         log_probs = F.log_softmax(logits, dim=-1)
         probs = F.softmax(logits, dim=-1)
         entropy = -(probs * log_probs).sum(dim=-1)
-        entropy = torch.clamp(entropy, min=0, max=20)  # 限制熵的范围
+        entropy = torch.clamp(entropy, min=0, max=20)
         return entropy
 
     def _select_top_m_positions(self, entropy: torch.Tensor, filled_mask: torch.Tensor, M_t: torch.Tensor):
@@ -149,12 +145,10 @@ class SpanFusionLM(nn.Module):
             if m_b <= 0:
                 continue
 
-            # 获取未填充的位置
             available_positions = (~filled_mask[b]).nonzero().flatten()
             if len(available_positions) == 0:
                 continue
 
-            # 选择熵最低的位置（优先级最高）
             available_entropy = entropy[b, available_positions]
             num_select = min(m_b, len(available_positions))
 
@@ -172,7 +166,7 @@ class SpanFusionLM(nn.Module):
                           temperature: float = 1.0,
                           top_p: float = 0.9,
                           is_teacher_path: bool = False):
-        """SpanFusionLM的前向传播核心实现"""
+        """简化版本的span前向传播，避免复杂的增量更新"""
 
         B, n_prompt = seq_prompt.shape
         device = seq_prompt.device
@@ -180,41 +174,40 @@ class SpanFusionLM(nn.Module):
         if K == 0:
             return {'seq': seq_prompt, 'z_pred': None, 'logits_span': None, 'p_g': None}
 
-        # 1. 构建初始序列（prompt + [PRED] tokens）
+        # 1. 构建初始序列
         pred_tokens = torch.full((B, K), self.config.pred_token_id, dtype=torch.long, device=device)
         seq = torch.cat([seq_prompt, pred_tokens], dim=1)
 
-        # 2. Decoder全量前向传播
+        # 2. 初始decoder前向
         embeddings = self.token_emb(seq)
         position_ids = torch.arange(n_prompt + K, device=device).unsqueeze(0).expand(B, -1)
 
-        h_dec, kv_cache = self.decoder(
+        h_dec, _ = self.decoder(
             hidden_states=embeddings,
             position_ids=position_ids,
             past_key_values=None,
-            use_cache=True
+            use_cache=False  # 简化：不使用KV缓存
         )
 
-        # 3. 计算PRED位置的初始logits和熵
-        h_pred_positions = h_dec[:, n_prompt:, :]  # (B, K, d)
-        logits_pred = self.proj_head(h_pred_positions)  # (B, K, V)
-        entropy = self._calc_entropy(logits_pred)  # (B, K)
+        # 3. 计算初始熵
+        h_pred_positions = h_dec[:, n_prompt:, :]
+        logits_pred = self.proj_head(h_pred_positions)
+        entropy = self._calc_entropy(logits_pred)
 
         # 4. GateNet预测步数
         if g is not None:
             g_hat = torch.full((B,), g, dtype=torch.long, device=device)
             gate_logits = None
         else:
-            mean_entropy = entropy.mean(dim=-1, keepdim=True)  # (B, 1)
+            mean_entropy = entropy.mean(dim=-1, keepdim=True)
             g_hat, gate_logits = self.gate_net(mean_entropy, train=self.training and not is_teacher_path)
 
         g_loop = g_hat.max().item() if g_hat.numel() > 0 else 0
 
-        # 5. 初始化latent和填充状态
-        z = self.token_emb(pred_tokens)  # (B, K, d)
+        # 5. 简化的refinement过程
+        z = self.token_emb(pred_tokens)
         filled_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
 
-        # 6. 迭代refinement
         for t in range(g_loop):
             active_mask = g_hat > t
             if not active_mask.any():
@@ -232,16 +225,14 @@ class SpanFusionLM(nn.Module):
             # Encoder refinement
             z = self.encoder.step(z, h_pred_positions.detach(), n_prompt)
 
-            # 投射并采样选中的位置
+            # 投射并采样
             if pick_mask.any():
-                z_picked = z[pick_mask]  # (num_picked, d)
+                z_picked = z[pick_mask]
                 logits_picked = self.proj_head(z_picked) / temperature
 
                 if is_teacher_path:
-                    # Teacher路径使用确定性选择
                     tokens_picked = torch.argmax(logits_picked, dim=-1)
                 else:
-                    # Student路径使用采样
                     tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
 
                 # 更新序列
@@ -250,22 +241,13 @@ class SpanFusionLM(nn.Module):
                 seq = seq_new
                 filled_mask = filled_mask | pick_mask
 
-            # 保存最终的z用于损失计算
+            # 保存用于损失计算
             if t == g_loop - 1:
                 if is_teacher_path:
                     self.z_teacher_for_loss = z.detach().clone()
                 else:
                     self.z_pred_for_loss = z.clone()
                     self.logits_span_for_loss = self.proj_head(z)
-
-            # 增量重算decoder（除了最后一步）
-            if t < g_loop - 1 and pick_mask.any():
-                # 修复：正确更新decoder状态
-                h_dec, kv_cache, entropy = self._incremental_decoder_update(
-                    seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy
-                )
-                # 更新h_pred_positions
-                h_pred_positions = h_dec[:, n_prompt:, :].detach()
 
         # 确保损失变量被设置
         if not is_teacher_path and self.z_pred_for_loss is None:
@@ -278,61 +260,6 @@ class SpanFusionLM(nn.Module):
             'logits_span': self.proj_head(z) if not is_teacher_path else None,
             'p_g': F.softmax(gate_logits, dim=-1) if gate_logits is not None else None
         }
-
-    def _incremental_decoder_update(self, seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy):
-        """增量更新decoder状态 - 修复版本"""
-        # 找到最左侧的更新位置
-        changed_positions = pick_mask.nonzero()
-        if len(changed_positions) == 0:
-            return h_dec, kv_cache, entropy
-
-        first_changed_pos = changed_positions[:, 1].min().item()
-        start_global_pos = n_prompt + first_changed_pos
-
-        # 准备增量输入
-        tokens_to_update = seq[:, start_global_pos:n_prompt + K]
-        if tokens_to_update.shape[1] == 0:
-            return h_dec, kv_cache, entropy
-
-        # 截断KV cache - 修复：创建新的list而不是修改tuple
-        truncated_kv_cache = []
-        if kv_cache:
-            for layer_kv in kv_cache:
-                k_cache, v_cache = layer_kv
-                k_truncated = k_cache[:, :, :start_global_pos, :]
-                v_truncated = v_cache[:, :, :start_global_pos, :]
-                truncated_kv_cache.append((k_truncated, v_truncated))
-
-        # 增量decoder前向
-        incremental_embeddings = self.token_emb(tokens_to_update)
-        B = seq.shape[0]
-        incremental_len = tokens_to_update.shape[1]
-        incremental_pos_ids = torch.arange(
-            start_global_pos, start_global_pos + incremental_len, device=seq.device
-        ).unsqueeze(0).expand(B, -1)
-
-        h_incremental, new_kv_cache = self.decoder(
-            hidden_states=incremental_embeddings,
-            position_ids=incremental_pos_ids,
-            past_key_values=tuple(truncated_kv_cache) if truncated_kv_cache else None,
-            use_cache=True
-        )
-
-        # 更新状态 - 修复：创建新的tensor而不是原地修改
-        h_dec_new = h_dec.clone()
-        h_dec_new[:, start_global_pos:n_prompt + K, :] = h_incremental
-
-        # 重新计算熵
-        h_pred_updated = h_dec_new[:, n_prompt:, :]
-        logits_updated = self.proj_head(h_pred_updated)
-        entropy_new = self._calc_entropy(logits_updated)
-
-        # 只更新未填充位置的熵
-        unfilled_mask = ~pick_mask
-        entropy_updated = entropy.clone()
-        entropy_updated[unfilled_mask] = entropy_new[unfilled_mask]
-
-        return h_dec_new, new_kv_cache, entropy_updated
 
     def forward(self,
                 seq_prompt: torch.Tensor,
@@ -350,7 +277,7 @@ class SpanFusionLM(nn.Module):
             is_teacher_path=False
         )
 
-        # Teacher路径（用于L_latent）
+        # Teacher路径
         if compute_teacher_latent:
             with torch.no_grad():
                 _ = self.span_forward_pass(
