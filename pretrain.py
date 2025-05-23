@@ -1,21 +1,21 @@
 # SpanFusionLM/pretrain.py
-import torch
-import torch.optim as optim
-import torch.nn.functional as F
-import random
-import math
-import logging
 import argparse
-from tqdm.auto import tqdm
+import logging
+import math
+import random
 from pathlib import Path
-import json
 
-import wandb # Assuming wandb is installed and configured
-from accelerate import Accelerator, DistributedType
+import datasets
+import torch
+import torch.nn.functional as F
+import torch.optim as optim
+import wandb  # Assuming wandb is installed and configured
+from accelerate import Accelerator
 from accelerate.utils import set_seed
 from datasets import load_dataset
-from torch.utils.data import DataLoader, IterableDataset
-from transformers import get_scheduler # For learning rate scheduling
+from torch.utils.data import DataLoader
+from tqdm.auto import tqdm
+from transformers import get_scheduler  # For learning rate scheduling
 
 from .model import SpanFusionLM, SpanFusionLMConfig
 from .modules.tokenizer import build_tokenizer
@@ -208,7 +208,7 @@ def main():
         datefmt="%m/%d/%Y %H:%M:%S",
         level=logging.INFO,
     )
-    logger.info(accelerator.state, main_process_only=False)
+    logger.info(accelerator.state)
     if accelerator.is_local_main_process:
         datasets.utils.logging.set_verbosity_warning()
         # transformers.utils.logging.set_verbosity_info() # If using transformers logging

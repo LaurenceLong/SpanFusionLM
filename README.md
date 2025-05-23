@@ -217,5 +217,5 @@ def generate(prompt, max_new=1024,
 
 SpanFusionLM 在保持自回归因果的同时，通过“熵排序 + GateNet 自调节步数 + 潜空间多步 Refinement + 增量 RoPE 解码”实现块内高质量补全。模型能自动分配思考预算：难 token 多想，易 token 速决；整体计算成本仅比同规模 GPT 上升约 20 %，适合直接落地大规模预训练。
 
-python -m spanfusionlm.pretrain   # 训练示例  
-python -m spanfusionlm.infer      # 推理示例
+python -m SpanFusionLM.pretrain   # 训练示例  
+python -m SpanFusionLM.infer      # 推理示例
