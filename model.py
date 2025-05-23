@@ -28,10 +28,23 @@ def top_p_logits_processor(logits: torch.Tensor, top_p: float):
     logits = logits.masked_fill(indices_to_remove, float("-inf"))
     return logits
 
+
 def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: float = 0.9):
+    """
+    对 logits 进行温度缩放、top-p 筛选，并用 multinomial 采样 token。
+    如果采样分布不合法，则回退到 argmax。
+    """
     logits = logits / temperature
-    logits = top_p_logits_processor(logits, top_p=top_p)
-    probs = F.softmax(logits, dim=-1)
+    if top_p < 1.0:
+        logits = top_p_logits_processor(logits, top_p=top_p)
+    probs = torch.softmax(logits, dim=-1)
+
+    # 检查 probs 是否存在 NaN、inf 或者概率分布总和为 0 的情况
+    if torch.isnan(probs).any() or torch.isinf(probs).any() or torch.sum(probs) <= 0:
+        # 回退到取最大值
+        return torch.argmax(logits, dim=-1)
+
+    # 如果 probs 为一维，则调整形状后采样
     if probs.ndim == 1:
         return torch.multinomial(probs.unsqueeze(0), num_samples=1).squeeze(-1).squeeze(0)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
