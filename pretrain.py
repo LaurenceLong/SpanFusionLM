@@ -51,7 +51,8 @@ def parse_args():
     parser.add_argument("--adam_beta2", type=float, default=0.95, help="AdamW beta2.")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping value.")
     parser.add_argument("--beta_cost_g", type=float, default=0.02, help="Coefficient for E[g] cost in loss.")
-    
+    parser.add_argument("--mixed_precision", type=str, default="fp16", help="Accelerator mixed_precision")
+
     parser.add_argument("--batch_size_per_device", type=int, default=8, help="Batch size per GPU.")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Number of gradient accumulation steps.")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Number of training epochs.")
@@ -200,7 +201,7 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, mixed_precision=args.mixed_precision)
     
     # Setup logging
     logging.basicConfig(
@@ -305,7 +306,7 @@ def main():
         num_training_steps=args.max_train_steps * args.gradient_accumulation_steps,
     )
 
-    # Prepare with Accelerator
+    # Prepare with accelerator
     model, optimizer, train_dataloader, eval_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, eval_dataloader, lr_scheduler
     )
@@ -314,8 +315,8 @@ def main():
     logger.info(f"  Num examples = {len(train_dataset)}")
     logger.info(f"  Num Epochs = {args.num_train_epochs}")
     logger.info(f"  Instantaneous batch size per device = {args.batch_size_per_device}")
-    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {args.batch_size_per_device * accelerator.num_processes * args.gradient_accumulation_steps}")
     logger.info(f"  Gradient Accumulation steps = {args.gradient_accumulation_steps}")
+    logger.info(f"  Total train batch size (w. parallel, distributed & accumulation) = {args.batch_size_per_device * accelerator.num_processes * args.gradient_accumulation_steps}")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
     progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process, desc="Training Steps")
