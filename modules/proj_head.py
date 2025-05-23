@@ -1,23 +1,24 @@
+# SpanFusionLM/modules/proj_head.py
 import torch
 import torch.nn as nn
 
 class ProjectionHead(nn.Module):
-    """
-    包含 LayerNorm 后接一个线性投影（权重共享至 TokenEmbedding.embedding）。
-    """
     def __init__(self, hidden_size, vocab_size, tied_embedding_weight=None):
         super().__init__()
         self.layer_norm = nn.LayerNorm(hidden_size)
+        
         if tied_embedding_weight is not None:
-            # 直接共享嵌入权重
-            self.tied_weight = tied_embedding_weight
+            # Share weights with token embedding
+            self.decoder_weight = tied_embedding_weight # This is E or W from description
         else:
-            self.tied_weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
-            nn.init.xavier_uniform_(self.tied_weight)
+            # Initialize new weights if not tied (should ideally be tied)
+            self.decoder_weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
+            nn.init.xavier_uniform_(self.decoder_weight)
 
-    def forward(self, x):
-        # x: (B, seq_len, hidden_size)
-        x = self.layer_norm(x)
-        # logits 形状：(B, seq_len, vocab_size)
-        logits = torch.matmul(x, self.tied_weight.t())
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (B, seq_len, hidden_size) or (N, hidden_size)
+        x_norm = self.layer_norm(x)
+        # Project to vocab size: (B, seq_len, V) or (N, V)
+        # Using W^T, so matmul(x_norm, W.T) where W is (V, D)
+        logits = torch.matmul(x_norm, self.decoder_weight.t())
         return logits
