@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from .rope import RotaryEmbedding, apply_rotary_pos_emb, rotate_half
-from .decoder import LlamaMLP
+from .decoder import LlamaMLP  # 复用 MLP
 
 class SpanEncoderSelfAttention(nn.Module):
     def __init__(self, hidden_size, num_heads, rope_theta=10000.0, max_position_embeddings=2048+32):
@@ -24,8 +24,8 @@ class SpanEncoderSelfAttention(nn.Module):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(self,
-                hidden_states: torch.Tensor,
-                position_ids: torch.Tensor,
+                hidden_states: torch.Tensor,  # (B, K, d)
+                position_ids: torch.Tensor,   # (B, K)
                 attention_mask: torch.Tensor = None):
         bsz, k_len, _ = hidden_states.size()
         query_states = self.q_proj(hidden_states)
@@ -71,9 +71,9 @@ class SpanEncoderCrossAttention(nn.Module):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
     def forward(self,
-                hidden_states: torch.Tensor,
-                encoder_hidden_states: torch.Tensor,
-                position_ids_q: torch.Tensor,
+                hidden_states: torch.Tensor,       # latent z (B, K, d)
+                encoder_hidden_states: torch.Tensor,  # h_dec (B, K, d)
+                position_ids_q: torch.Tensor,           # (B, K)
                 attention_mask: torch.Tensor = None):
         bsz_q, k_len_q, _ = hidden_states.size()
         bsz_kv, k_len_kv, _ = encoder_hidden_states.size()
@@ -117,9 +117,9 @@ class SpanEncoderLayer(nn.Module):
         self.post_cross_attn_layernorm = nn.LayerNorm(hidden_size)
 
     def forward(self,
-                latent_z: torch.Tensor,
-                h_dec_k_positions: torch.Tensor,
-                global_position_ids_k: torch.Tensor,
+                latent_z: torch.Tensor,          # (B, K, d)
+                h_dec_k_positions: torch.Tensor, # (B, K, d)
+                global_position_ids_k: torch.Tensor,  # (B, K)
                 self_attn_mask: torch.Tensor = None,
                 cross_attn_mask: torch.Tensor = None):
         # Self-Attention
@@ -157,12 +157,16 @@ class SpanEncoder(nn.Module):
         ])
 
     def step(self,
-             latent_z: torch.Tensor,
-             h_dec_k_positions: torch.Tensor,
+             latent_z: torch.Tensor,          # (B, K, d)
+             h_dec_k_positions: torch.Tensor, # (B, K, d)
              prompt_len: int):
+        """
+        对全部 K 个槽位执行一次 refinement，将 prompt_len 与 span 内偏移组合计算全局位置。
+        """
         bsz, K, _ = latent_z.shape
         k_idx = torch.arange(K, device=latent_z.device)
         global_position_ids_k = (prompt_len + k_idx).unsqueeze(0).expand(bsz, K)
+        # 构造全 0 mask（bidirectional attention，不屏蔽任何位置）
         self_attn_mask = torch.zeros(bsz, 1, K, K, dtype=torch.bool, device=latent_z.device)
         cross_attn_mask = torch.zeros(bsz, 1, K, K, dtype=torch.bool, device=latent_z.device)
 

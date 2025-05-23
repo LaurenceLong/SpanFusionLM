@@ -123,7 +123,7 @@ class SpanDecoder(nn.Module):
         return causal_mask[None, None, :, :].expand(B, 1, q_len, kv_len)
 
     def forward(self,
-                hidden_states: torch.Tensor,
+                hidden_states: torch.Tensor,  # (B, seq_len, hidden_size)
                 attention_mask: torch.Tensor = None,
                 position_ids: torch.Tensor = None,
                 past_key_values=None,
