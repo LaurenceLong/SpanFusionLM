@@ -14,10 +14,21 @@ class LlamaMLP(nn.Module):
         self.act_fn = F.silu
 
     def forward(self, x):
-        return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
+        # 分别计算两路全连接
+        gate = self.gate_proj(x)
+        up = self.up_proj(x)
+        # 对 gate 输出使用激活函数
+        activated = self.act_fn(gate)
+        # 为了防止数值溢出或出现 NaN，对激活后的值和 up_proj 的输出进行数值稳定性处理
+        activated = torch.nan_to_num(activated, nan=0.0, posinf=1e6, neginf=-1e6)
+        up = torch.nan_to_num(up, nan=0.0, posinf=1e6, neginf=-1e6)
+        hidden = activated * up
+        hidden = torch.clamp(hidden, min=-1e6, max=1e6)
+        hidden = torch.nan_to_num(hidden, nan=0.0, posinf=1e6, neginf=-1e6)
+        return self.down_proj(hidden)
 
 class LlamaAttention(nn.Module):
-    def __init__(self, config): # Pass full config
+    def __init__(self, config): # 传入完整配置
         super().__init__()
         self.config = config
         self.hidden_size = config.hidden_size
@@ -25,7 +36,7 @@ class LlamaAttention(nn.Module):
         self.head_dim = self.hidden_size // self.num_heads
         if (self.head_dim * self.num_heads) != self.hidden_size:
             raise ValueError(f"hidden_size {self.hidden_size} must be divisible by num_heads {self.num_heads}")
-        
+
         self.q_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.k_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_heads * self.head_dim, bias=False)
@@ -42,11 +53,11 @@ class LlamaAttention(nn.Module):
 
     def forward(self,
                 hidden_states: torch.Tensor,
-                attention_mask: torch.Tensor, # This is the causal mask prepared by SpanDecoder
+                attention_mask: torch.Tensor,  # 由 SpanDecoder 构造的因果 mask
                 position_ids: torch.Tensor,
-                past_key_value=None): # Tuple of (past_key, past_value)
+                past_key_value=None):  # Tuple of (past_key, past_value)
         bsz, q_len, _ = hidden_states.size()
-        
+
         query_states = self.q_proj(hidden_states)
         key_states = self.k_proj(hidden_states)
         value_states = self.v_proj(hidden_states)
@@ -55,37 +66,37 @@ class LlamaAttention(nn.Module):
         key_states = self._shape(key_states, q_len, bsz)
         value_states = self._shape(value_states, q_len, bsz)
 
-        # RoPE application
-        # position_ids are (bsz, q_len)
-        # rotary_emb needs seq_len for cache, but uses position_ids for actual freqs
-        cos, sin = self.rotary_emb(value_states, seq_len=position_ids.max().item() + 1 if position_ids.numel() > 0 else q_len, position_ids=position_ids)
+        # 应用 RoPE（旋转位置编码）
+        cos, sin = self.rotary_emb(
+            value_states,
+            seq_len=position_ids.max().item() + 1 if position_ids.numel() > 0 else q_len,
+            position_ids=position_ids
+        )
         query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
 
         if past_key_value is not None:
-            # reuse k, v, self_attention
             past_key, past_value = past_key_value
             key_states = torch.cat([past_key, key_states], dim=2)
             value_states = torch.cat([past_value, value_states], dim=2)
-        
-        # Current key and value for caching in this pass
+
         present_key_value = (key_states, value_states)
 
         attn_output = F.scaled_dot_product_attention(
             query_states,
             key_states,
             value_states,
-            attn_mask=attention_mask, # Use the passed causal mask
-            dropout_p=0.0 # No dropout during attention itself if not specified
+            attn_mask=attention_mask,  # 使用传入的因果 mask
+            dropout_p=0.0  # 此处不添加 dropout
         )
-        
+
         attn_output = attn_output.transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
-        
+
         return attn_output, present_key_value
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config): # Pass full config
+    def __init__(self, config):  # 传入完整配置
         super().__init__()
         self.self_attn = LlamaAttention(config)
         self.mlp = LlamaMLP(config.hidden_size, config.intermediate_size)
@@ -96,27 +107,27 @@ class LlamaDecoderLayer(nn.Module):
                 hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor,
                 position_ids: torch.Tensor,
-                past_key_value=None): # Tuple of (past_key, past_value) for this layer
+                past_key_value=None):  # 当前层的过去KV (past_key, past_value)
         residual = hidden_states
         hidden_states_norm = self.input_layernorm(hidden_states)
-        
+
         attn_output, present_key_value = self.self_attn(
             hidden_states_norm,
             attention_mask=attention_mask,
             position_ids=position_ids,
             past_key_value=past_key_value
         )
-        hidden_states = residual + attn_output # Add back residual before second norm
+        hidden_states = residual + attn_output  # add residual 前
 
         residual = hidden_states
         hidden_states_norm = self.post_attention_layernorm(hidden_states)
         mlp_output = self.mlp(hidden_states_norm)
         hidden_states = residual + mlp_output
-        
-        return hidden_states, present_key_value # Return hidden states and KV for this layer
+
+        return hidden_states, present_key_value  # 返回当前隐藏状态与当前层 KV
 
 class SpanDecoder(nn.Module):
-    def __init__(self, config): # Pass full config
+    def __init__(self, config):  # 传入完整配置
         super().__init__()
         self.config = config
         self.layers = nn.ModuleList([
@@ -125,79 +136,27 @@ class SpanDecoder(nn.Module):
         self.norm = nn.LayerNorm(config.hidden_size)
 
     def _prepare_decoder_attention_mask(self, input_shape, dtype, device, past_kv_length):
-        # input_shape is (batch_size, seq_len) of current input tokens
-        # past_kv_length is the length of sequences in past_key_values
+        # input_shape 为 (batch_size, seq_len)——当前输入 tokens 数量
         batch_size, q_len = input_shape
-        
-        # Total length of keys/values will be past_kv_length + q_len
         kv_seq_len = past_kv_length + q_len
-        
-        # Create a causal mask of shape (q_len, kv_seq_len)
-        # Mask value of True indicates masking, False allows attention
-        # F.scaled_dot_product_attention expects:
-        # -inf for positions to be masked, 0 for allowed positions.
+
+        # 构造一个大小为 (q_len, kv_seq_len) 的因果 mask
         mask = torch.full((q_len, kv_seq_len), float("-inf"), dtype=dtype, device=device)
-        
-        # Allow attention to all past keys and current/past tokens in current input
         for i in range(q_len):
             mask[i, :(past_kv_length + i + 1)] = 0
-            
-        # Expand to (bsz, 1, q_len, kv_seq_len) for multi-head attention
+
+        # 扩展成 (bsz, 1, q_len, kv_seq_len)
         return mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, q_len, kv_seq_len)
 
-
     def forward(self,
-                hidden_states: torch.Tensor,  # (B, current_seq_len, hidden_size)
-                attention_mask: torch.Tensor = None, # Optional external mask
-                position_ids: torch.Tensor = None,   # (B, current_seq_len)
-                past_key_values=None, # Tuple of tuples, one for each layer: ((k,v), (k,v), ...)
+                hidden_states: torch.Tensor,  # (B, 当前序列长度, hidden_size)
+                attention_mask: torch.Tensor = None,
+                position_ids: torch.Tensor = None,  # (B, 当前序列长度)
+                past_key_values=None,  # 每层的缓存 KV，格式为 ((k,v), (k,v), …)
                 use_cache: bool = True):
-        
+
         batch_size, current_seq_len, _ = hidden_states.shape
-        
-        # Determine past_kv_length from past_key_values if provided
+
         past_kv_length = 0
         if past_key_values is not None and past_key_values[0] is not None and past_key_values[0][0] is not None:
-            past_kv_length = past_key_values[0][0].shape[2] # k_cache is (B, num_heads, seq_len_cached, head_dim)
-
-        # If position_ids are not provided, create them starting from past_kv_length
-        if position_ids is None:
-            position_ids = torch.arange(
-                past_kv_length, 
-                current_seq_len + past_kv_length,
-                dtype=torch.long, 
-                device=hidden_states.device
-            )
-            position_ids = position_ids.unsqueeze(0).expand(batch_size, -1)
-
-        # If an explicit attention_mask is not provided, create the causal one
-        if attention_mask is None:
-            attention_mask = self._prepare_decoder_attention_mask(
-                (batch_size, current_seq_len), 
-                hidden_states.dtype, 
-                hidden_states.device, 
-                past_kv_length
-            )
-        # Else, the provided attention_mask should be correctly shaped (B, 1, Q_len, KV_len)
-
-        output_hidden_states = hidden_states
-        
-        next_kv_cache_list = [] if use_cache else None
-
-        for i, layer in enumerate(self.layers):
-            layer_past_kv = past_key_values[i] if past_key_values is not None else None
-            
-            output_hidden_states, layer_present_kv = layer(
-                output_hidden_states,
-                attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=layer_past_kv
-            )
-            if use_cache:
-                next_kv_cache_list.append(layer_present_kv)
-        
-        output_hidden_states = self.norm(output_hidden_states)
-        
-        final_kv_cache = tuple(next_kv_cache_list) if use_cache and next_kv_cache_list else None
-        
-        return output_hidden_states, final_kv_cache
+            past_kv_length
