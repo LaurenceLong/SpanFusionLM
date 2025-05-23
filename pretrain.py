@@ -29,15 +29,15 @@ def parse_args():
     parser.add_argument("--dataset_config_name", type=str, default="wikitext-103-raw-v1", help="Configuration name for the dataset.")
     parser.add_argument("--train_split", type=str, default="train", help="Dataset split for training.")
     parser.add_argument("--eval_split", type=str, default="test", help="Dataset split for evaluation.")
-    parser.add_argument("--max_seq_length", type=int, default=2048, help="Maximum sequence length for model input.")
+    parser.add_argument("--max_seq_length", type=int, default=992, help="Maximum sequence length for model input.")
     
     # Model args
     parser.add_argument("--tokenizer_name", type=str, default="gpt2", help="Tokenizer name or path.")
-    parser.add_argument("--hidden_size", type=int, default=4096, help="Model hidden size.")
-    parser.add_argument("--intermediate_size", type=int, default=11008, help="MLP intermediate size.")
-    parser.add_argument("--num_decoder_layers", type=int, default=28, help="Number of decoder layers.")
-    parser.add_argument("--num_encoder_layers", type=int, default=8, help="Number of encoder layers.")
-    parser.add_argument("--num_attention_heads", type=int, default=32, help="Number of attention heads.")
+    parser.add_argument("--hidden_size", type=int, default=768, help="Model hidden size.")
+    parser.add_argument("--intermediate_size", type=int, default=3072, help="MLP intermediate size.")
+    parser.add_argument("--num_decoder_layers", type=int, default=8, help="Number of decoder layers.")
+    parser.add_argument("--num_encoder_layers", type=int, default=4, help="Number of encoder layers.")
+    parser.add_argument("--num_attention_heads", type=int, default=12, help="Number of attention heads.")
     # max_position_embeddings will be max_seq_length + max_K from span_lengths
     parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta value.")
     parser.add_argument("--g_max", type=int, default=8, help="Maximum GateNet steps.")
