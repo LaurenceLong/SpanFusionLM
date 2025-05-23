@@ -260,7 +260,12 @@ class SpanFusionLM(nn.Module):
 
             # 增量重算decoder（除了最后一步）
             if t < g_loop - 1 and pick_mask.any():
-                self._incremental_decoder_update(seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy, logits_pred)
+                # 修复：正确更新decoder状态
+                h_dec, kv_cache, entropy = self._incremental_decoder_update(
+                    seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy
+                )
+                # 更新h_pred_positions
+                h_pred_positions = h_dec[:, n_prompt:, :].detach()
 
         # 确保损失变量被设置
         if not is_teacher_path and self.z_pred_for_loss is None:
@@ -274,12 +279,12 @@ class SpanFusionLM(nn.Module):
             'p_g': F.softmax(gate_logits, dim=-1) if gate_logits is not None else None
         }
 
-    def _incremental_decoder_update(self, seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy, logits_pred):
-        """增量更新decoder状态"""
+    def _incremental_decoder_update(self, seq, pick_mask, n_prompt, K, kv_cache, h_dec, entropy):
+        """增量更新decoder状态 - 修复版本"""
         # 找到最左侧的更新位置
         changed_positions = pick_mask.nonzero()
         if len(changed_positions) == 0:
-            return
+            return h_dec, kv_cache, entropy
 
         first_changed_pos = changed_positions[:, 1].min().item()
         start_global_pos = n_prompt + first_changed_pos
@@ -287,9 +292,9 @@ class SpanFusionLM(nn.Module):
         # 准备增量输入
         tokens_to_update = seq[:, start_global_pos:n_prompt + K]
         if tokens_to_update.shape[1] == 0:
-            return
+            return h_dec, kv_cache, entropy
 
-        # 截断KV cache
+        # 截断KV cache - 修复：创建新的list而不是修改tuple
         truncated_kv_cache = []
         if kv_cache:
             for layer_kv in kv_cache:
@@ -313,18 +318,21 @@ class SpanFusionLM(nn.Module):
             use_cache=True
         )
 
-        # 更新状态
-        kv_cache[:] = new_kv_cache
-        h_dec[:, start_global_pos:n_prompt + K, :] = h_incremental
+        # 更新状态 - 修复：创建新的tensor而不是原地修改
+        h_dec_new = h_dec.clone()
+        h_dec_new[:, start_global_pos:n_prompt + K, :] = h_incremental
 
         # 重新计算熵
-        h_pred_updated = h_dec[:, n_prompt:, :]
+        h_pred_updated = h_dec_new[:, n_prompt:, :]
         logits_updated = self.proj_head(h_pred_updated)
         entropy_new = self._calc_entropy(logits_updated)
 
         # 只更新未填充位置的熵
         unfilled_mask = ~pick_mask
-        entropy[unfilled_mask] = entropy_new[unfilled_mask]
+        entropy_updated = entropy.clone()
+        entropy_updated[unfilled_mask] = entropy_new[unfilled_mask]
+
+        return h_dec_new, new_kv_cache, entropy_updated
 
     def forward(self,
                 seq_prompt: torch.Tensor,
