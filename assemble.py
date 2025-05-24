@@ -31,6 +31,12 @@ EXCLUDE_FILES = {
     # 添加其他你想要排除的文件
 }
 
+INCLUDE_FILES = {
+    'gate_net.py',
+    'model.py',
+    'pretrain.py',
+}
+
 # 要包含的文件扩展名 (如果列表不为空，则只包含这些扩展名的文件)
 # 如果为空列表 `[]` 或 `None`，则包含所有未被 EXCLUDE_FILES 排除的文件
 INCLUDE_EXTENSIONS = [
@@ -138,12 +144,13 @@ def generate_project_structure(root_dir, exclude_dirs, exclude_files, include_ex
     return "\n".join(tree_lines)
 
 
-def read_files_content(root_dir, exclude_dirs, exclude_files, include_extensions):
+def read_files_content(root_dir, exclude_dirs, exclude_files, include_extensions, include_files):
     """读取项目中符合条件的文件内容"""
     file_contents = []
     exclude_dirs_set = set(exclude_dirs)
     exclude_files_set = set(exclude_files)
     include_extensions_set = set(include_extensions) if include_extensions else None
+    include_files_set = set(include_files) if include_files else None
 
     # 获取脚本自身的文件名
     try:
@@ -160,6 +167,9 @@ def read_files_content(root_dir, exclude_dirs, exclude_files, include_extensions
         for f in files:
             if f in exclude_files_set:
                 continue
+            if include_files_set:
+                if f not in include_files_set:
+                    continue
 
             file_path = os.path.join(root, f)
             relative_path = os.path.relpath(file_path, root_dir)
@@ -202,7 +212,8 @@ def main():
         ROOT_DIR,
         EXCLUDE_DIRS,
         EXCLUDE_FILES,
-        INCLUDE_EXTENSIONS
+        INCLUDE_EXTENSIONS,
+        INCLUDE_FILES,
     )
 
     # 3. 组装最终的 prompt

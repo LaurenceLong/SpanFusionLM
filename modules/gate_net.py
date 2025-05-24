@@ -6,10 +6,9 @@ import torch.nn.functional as F
 class GateNet(nn.Module):
     def __init__(self, input_dim=1, hidden_dim=256, g_max=8):
         super().__init__()
-        self.g_max = g_max
+        self.g_max = g_max  # 最大迭代步数（仅用于传递配置）
         self.hidden_dim = hidden_dim
 
-        # 更深的网络以更好地预测步数
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.LayerNorm(hidden_dim),
@@ -19,7 +18,7 @@ class GateNet(nn.Module):
             nn.LayerNorm(hidden_dim // 2),
             nn.ReLU(),
             nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, g_max)
+            nn.Linear(hidden_dim // 2, 2)  # 二分类输出：0 表示停止，1 表示继续
         )
         self.override_fn = None
 
@@ -29,36 +28,25 @@ class GateNet(nn.Module):
 
     def forward(self, entropy_feature: torch.Tensor, train: bool = True):
         """
-        entropy_feature: (B, input_dim) - 通常是平均熵 (B, 1)
-        返回: g_hat (B,), logits (B, g_max)
+        entropy_feature: (B, input_dim) – 通常为平均熵 (B,1)
+        返回:
+          decision: (B,) ，0 表示提前停止，1 表示继续迭代；
+          logits: (B,2) 未归一化logits
         """
         if self.override_fn is not None:
             logits = self.override_fn(entropy_feature)
         else:
             logits = self.mlp(entropy_feature)
 
-        # 数值稳定性处理
         logits = torch.clamp(logits, min=-10, max=10)
 
         if train:
-            # 改进的Gumbel-Softmax采样
-            gumbels = -torch.empty_like(logits).exponential_().log()
-            gumbels = torch.clamp(gumbels, min=-10, max=10)
-
-            logits_with_gumbel = (logits + gumbels) / 1.0  # tau=1.0
-            g_one_hot = F.softmax(logits_with_gumbel, dim=-1)
-
-            # 使用straight-through estimator
-            g_indices = g_one_hot.argmax(dim=-1)
-            g_one_hot_hard = F.one_hot(g_indices, num_classes=self.g_max).float()
-            g_one_hot = g_one_hot_hard - g_one_hot.detach() + g_one_hot
+            # 使用 Gumbel Softmax 实现带硬采样的梯度传递
+            decision_one_hot = F.gumbel_softmax(logits, tau=0.5, hard=True)
         else:
-            # 推理时使用确定性选择
-            g_indices = logits.argmax(dim=-1)
-            g_one_hot = F.one_hot(g_indices, num_classes=self.g_max).float()
+            decisions = logits.argmax(dim=-1)
+            decision_one_hot = F.one_hot(decisions, num_classes=2).float()
 
-        # 计算实际步数 (1 to g_max)
-        gate_values = torch.arange(1, self.g_max + 1, device=logits.device, dtype=torch.float)
-        g_hat = (g_one_hot * gate_values).sum(dim=-1).long()
-
-        return g_hat, logits
+        # 如果概率最大的位置索引为 1，则输出 1 表示继续，否则为 0 表示停止
+        decision = decision_one_hot.argmax(dim=-1)
+        return decision, logits
