@@ -1,4 +1,4 @@
-# SpanFusionLM/modules/tokenizer.py
+# modules/tokenizer.py
 from transformers import AutoTokenizer, GPT2Tokenizer
 
 def build_tokenizer(tokenizer_name_or_path="gpt2", **kwargs):
@@ -20,17 +20,17 @@ def build_tokenizer(tokenizer_name_or_path="gpt2", **kwargs):
         'bos_token': '<BOS>',
         'eos_token': '<EOS>',
         'pad_token': '<PAD>',
-        'additional_special_tokens': ['<|PRED|>'] # For span filling
+        'additional_special_tokens': ['<|PRED|>', '<|TBD|>']  # 新增 <|TBD|> token
     }
-    
+
     # Check existing special tokens and add if not present or different
     current_special_tokens = {}
     if tokenizer.bos_token: current_special_tokens['bos_token'] = tokenizer.bos_token
     if tokenizer.eos_token: current_special_tokens['eos_token'] = tokenizer.eos_token
     if tokenizer.pad_token: current_special_tokens['pad_token'] = tokenizer.pad_token
-    
+
     num_added_toks = tokenizer.add_special_tokens(special_tokens_to_add)
-    
+
     if num_added_toks > 0:
         print(f"Added {num_added_toks} special tokens to tokenizer: {special_tokens_to_add}")
 
@@ -39,27 +39,20 @@ def build_tokenizer(tokenizer_name_or_path="gpt2", **kwargs):
         if tokenizer.eos_token is not None:
             print(f"Warning: tokenizer.pad_token was None. Setting it to eos_token: {tokenizer.eos_token}")
             tokenizer.pad_token = tokenizer.eos_token
-        else: # Fallback if EOS is also None, though unlikely after adding
-            # This case needs careful handling, as padding is crucial.
-            # Using a newly added special token if available, or erroring.
-            # For now, assume <PAD> gets added and has an ID.
+        else:
             if special_tokens_to_add['pad_token'] in tokenizer.get_vocab():
                  tokenizer.pad_token = special_tokens_to_add['pad_token']
-            else: # Should not happen if add_special_tokens worked
+            else:
                  raise ValueError("pad_token is None and could not be set. Please check tokenizer.")
 
+    # 设置 tbd_token_id 属性以便后续使用
+    if '<|TBD|>' in tokenizer.additional_special_tokens:
+        tokenizer.tbd_token_id = tokenizer.convert_tokens_to_ids('<|TBD|>')
+    else:
+        tokenizer.tbd_token_id = None
 
-    # Make len(tokenizer) return vocab_size
+    # 使 len(tokenizer) 返回词表大小
     if not hasattr(tokenizer, "__len__"):
         setattr(tokenizer, "__len__", lambda: tokenizer.vocab_size)
-        
-    # Store PRED token ID for convenience if needed, though config should handle it
-    # pred_token_str = '<|PRED|>'
-    # if pred_token_str in tokenizer.additional_special_tokens:
-    #     tokenizer.pred_token_id = tokenizer.convert_tokens_to_ids(pred_token_str)
-    # else:
-    #     # This case means <|PRED|> wasn't added or found, which is an issue.
-    #     # The config's __post_init__ will handle getting the ID.
-    #     pass
 
     return tokenizer

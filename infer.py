@@ -45,56 +45,35 @@ def generate(args):
     prompt_len = seq.shape[1]
     generated_tokens = 0
 
-    def fast_override_fn(entropy_tensor):
-        # 始终输出“停止”=0 的低分
-        batch_size = entropy_tensor.size(0)
-        # shape = (batch, 2)
-        logits = torch.tensor([[+1e9, -1e9]], device=entropy_tensor.device, dtype=torch.float)
-        return logits.expand(batch_size, 2)
-
-    def accurate_override_fn(entropy_tensor):
-        # 始终输出“停止”=0 的低分
-        batch_size = entropy_tensor.size(0)
-        # shape = (batch, 2)
-        logits = torch.tensor([[-1e9, +1e9]], device=entropy_tensor.device, dtype=torch.float)
-        return logits.expand(batch_size, 2)
-
-    print(f"Starting generation with K={args.K}, mode='{args.generation_mode}'...")
-
-    # 设置 GateNet 的 override 函数（仅在推理时有效）
-    if args.generation_mode == 'fast':
-        model.gate_net.override(fast_override_fn)
-    elif args.generation_mode == 'accurate':
-        model.gate_net.override(accurate_override_fn)
-    else:
-        model.gate_net.override(None)
-
+    print(f"Starting generation with max_new_tokens={args.max_new_tokens}...")
     with torch.no_grad():
         while generated_tokens < args.max_new_tokens:
             current_seq_len = seq.shape[1]
-            K_to_generate = min(args.K, args.max_new_tokens - generated_tokens)
-            if K_to_generate <= 0:
-                break
-
-            if current_seq_len + K_to_generate > config.max_position_embeddings:
-                print(f"Warning: Sequence length {current_seq_len + K_to_generate} might exceed max_position_embeddings {config.max_position_embeddings}. Truncating K.")
-                K_to_generate = config.max_position_embeddings - current_seq_len
-                if K_to_generate <= 0:
+            # 使用模型配置中的固定 span 长度
+            K = model.config.fixed_span_length
+            if current_seq_len + K > config.max_position_embeddings:
+                print(f"Warning: Sequence length {current_seq_len + K} might exceed max_position_embeddings {config.max_position_embeddings}. Truncating K.")
+                K = config.max_position_embeddings - current_seq_len
+                if K <= 0:
                     print("Cannot generate further due to max length.")
                     break
 
             prompt_for_span = seq
-
             out = model.span_forward_pass(
                 prompt_for_span,
-                K_to_generate,
+                K,
                 temperature=args.temperature,
                 top_p=args.top_p
             )
 
-            newly_generated_part = out['seq'][:, current_seq_len : current_seq_len + K_to_generate]
+            newly_generated_part = out['seq'][:, current_seq_len : current_seq_len + K]
             seq = out['seq']
             generated_tokens += newly_generated_part.shape[1]
+
+            # 如果生成的最后一个 token 为 <|TBD|> 则提前停止
+            if tokenizer.tbd_token_id is not None and (tokenizer.tbd_token_id in newly_generated_part[0]):
+                print("TBD token generated. Early stopping.")
+                break
 
             if (tokenizer.eos_token_id is not None) and (tokenizer.eos_token_id in newly_generated_part[0]):
                 print("EOS token generated.")
@@ -116,8 +95,6 @@ if __name__ == "__main__":
     parser.add_argument("--model_name_or_path", type=str, required=True, help="Path to the pretrained model directory.")
     parser.add_argument("--prompt", type=str, default="Hello world", help="Initial prompt for generation.")
     parser.add_argument("--max_new_tokens", type=int, default=64, help="Maximum number of new tokens to generate.")
-    parser.add_argument("--K", type=int, default=16, help="Span length K for generation.")
-    parser.add_argument("--generation_mode", type=str, default="auto", choices=["auto", "fast", "accurate"], help="Generation mode for GateNet.")
     parser.add_argument("--temperature", type=float, default=0.8, help="Sampling temperature.")
     parser.add_argument("--top_p", type=float, default=0.9, help="Nucleus sampling top_p.")
     parser.add_argument("--device", type=str, default="cuda", choices=["cuda", "cpu"], help="Device to use for generation.")

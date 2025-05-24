@@ -1,5 +1,6 @@
 # model.py
 import json
+import math
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 
@@ -9,7 +10,6 @@ import torch.nn.functional as F
 
 from .modules.decoder import SpanDecoder
 from .modules.encoder import SpanEncoder
-from .modules.gate_net import GateNet
 from .modules.proj_head import ProjectionHead
 from .modules.token_emb import TokenEmbedding
 from .modules.tokenizer import build_tokenizer
@@ -37,7 +37,15 @@ def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: fl
     probs = torch.softmax(logits, dim=-1)
     if torch.isnan(probs).any() or torch.isinf(probs).any():
         return torch.argmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    if logits.dim() == 2:
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
+    elif logits.dim() == 3:
+        B, L, _ = logits.shape
+        logits_flat = logits.view(-1, logits.size(-1))
+        tokens = torch.multinomial(torch.softmax(logits_flat, dim=-1), num_samples=1)
+        return tokens.view(B, L)
+    else:
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 @dataclass
@@ -51,31 +59,42 @@ class SpanFusionLMConfig:
     max_position_embeddings: int = 2048 + 32
     rope_theta: float = 10000.0
     g_max: int = 8
+    max_seq_length: int = 512  # 新增最大序列长度，用于计算固定 span 长度
     tokenizer_name: str = "gpt2"
     tokenizer: any = field(default=None, repr=False, compare=False)
 
     pred_token_id: int = None
+    tbd_token_id: int = None  # 用以记录 <|TBD|> token 的 ID
     pad_token_id: int = None
     bos_token_id: int = None
     eos_token_id: int = None
+    fixed_span_length: int = None  # 将在 __post_init__ 中计算
 
     def __post_init__(self):
         if self.tokenizer is None:
             self.tokenizer = build_tokenizer(self.tokenizer_name)
         if self.vocab_size is None or self.vocab_size == 32000:
             self.vocab_size = len(self.tokenizer)
-        # 确保特殊 token <|PRED|> 已经被添加
+        # 确保特殊 token <|PRED|> 和 <|TBD|> 已经被添加
         if hasattr(self.tokenizer, 'additional_special_tokens'):
             if '<|PRED|>' not in self.tokenizer.additional_special_tokens:
                 self.tokenizer.add_special_tokens({'additional_special_tokens': ['<|PRED|>']})
             self.pred_token_id = self.tokenizer.additional_special_tokens_ids[
                 self.tokenizer.additional_special_tokens.index('<|PRED|>')
             ]
+            if '<|TBD|>' not in self.tokenizer.additional_special_tokens:
+                self.tokenizer.add_special_tokens({'additional_special_tokens': ['<|TBD|>']})
+            self.tbd_token_id = self.tokenizer.additional_special_tokens_ids[
+                self.tokenizer.additional_special_tokens.index('<|TBD|>')
+            ]
         else:
-            self.pred_token_id = self.pad_token_id  # fallback 如果没有 additional_special_tokens
+            self.pred_token_id = self.pad_token_id  # fallback
+            self.tbd_token_id = self.pad_token_id
         self.pad_token_id = self.tokenizer.pad_token_id
         self.bos_token_id = self.tokenizer.bos_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
+        # 计算固定 span 长度：ceil(sqrt(max_seq_length))
+        self.fixed_span_length = math.ceil(math.sqrt(self.max_seq_length))
 
     def save_pretrained(self, save_directory: str):
         config_dict = asdict(self)
@@ -110,8 +129,7 @@ class SpanFusionLM(nn.Module):
             config.vocab_size,
             tied_embedding_weight=self.token_emb.embedding.weight
         )
-        # 使用基于二分类的 GateNet
-        self.gate_net = GateNet(input_dim=1, hidden_dim=config.hidden_size // 4)
+        # GateNet 已内化，不再单独使用
 
     def _calc_entropy(self, logits: torch.Tensor):
         logits = torch.clamp(logits, min=-50, max=50)
@@ -121,47 +139,33 @@ class SpanFusionLM(nn.Module):
         entropy = torch.clamp(entropy, min=0, max=20)
         return entropy
 
-    def _select_top_m_positions(self, entropy: torch.Tensor, filled_mask: torch.Tensor, M_t: torch.Tensor):
-        # 将已填充（更新过）的部分设为 -inf，
-        # 并选取剩余位置中熵值最高的前 max_M 个
-        masked_entropy = entropy.clone()
-        masked_entropy[filled_mask] = float('-inf')
-        max_M = int(M_t.max().item())
-        _, idxs = torch.topk(masked_entropy, k=max_M, largest=True, dim=-1)  # 选择最高熵的位置
-        pick_mask = torch.zeros_like(filled_mask, dtype=torch.bool)
-        for m in range(max_M):
-            condition = (M_t > m).unsqueeze(-1)
-            pick_mask.scatter_(1, idxs[:, m:m+1], condition)
-        return pick_mask
-
-    def span_forward_pass(self,
-                          seq_prompt: torch.Tensor,
-                          K: int,
-                          temperature: float = 1.0,
-                          top_p: float = 0.9):
+    def forward(self,
+                  seq_prompt: torch.Tensor,
+                  temperature: float = 1.0,
+                  top_p: float = 1.0):
         """
-        使用二分类 GateNet 实现动态迭代：
-        每一步由 GateNet 根据当前平均熵决定是否继续迭代。
+        优化后的 span forward pass：
+          - 固定使用 fixed_span_length = ceil(sqrt(max_seq_length))
+          - 训练数据的 span 为 fixed_span_length tokens（前 fixed_span_length-1 为真实 token，最后一个固定为 <|TBD|>）
+          - 每一步先使用 Decoder 预测 span，再利用 Encoder + Proj Head 对 span 最后一个位置进行预测，
+            当预测为 <|TBD|> 或达到 g_max 迭代步数时停止。
         """
         B, n_prompt = seq_prompt.shape
         device = seq_prompt.device
+        fixed_span_length = self.config.fixed_span_length
 
-        # 构造初始序列：在 prompt 后附加 K 个 [PRED] 占位符
-        pred_tokens = torch.full((B, K), self.config.pred_token_id, dtype=torch.long, device=device)
+        # 构造初始序列：在 prompt 后追加 fixed_span_length 个 [PRED] 占位符
+        pred_tokens = torch.full((B, fixed_span_length), self.config.pred_token_id, dtype=torch.long, device=device)
         seq = torch.cat([seq_prompt, pred_tokens], dim=1)
 
-        # 初始化填充掩码，记录哪些位置已被更新
-        filled_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
+        # 初始化迭代计数和活动 mask（记录哪些样本仍处于更新中）
         iteration_count = torch.zeros(B, device=device, dtype=torch.long)
-
         active_mask = torch.ones(B, dtype=torch.bool, device=device)
-        max_iters = self.config.g_max
-        M_step = (K + max_iters - 1) // max_iters
 
-        # 初始化编码器输入 z
+        # 初始 Encoder 隐状态，根据占位符生成
         z = self.token_emb(pred_tokens)
 
-        for t in range(max_iters):
+        for t in range(self.config.g_max):
             if not active_mask.any():
                 break
 
@@ -177,52 +181,32 @@ class SpanFusionLM(nn.Module):
                 past_key_values=None,
                 use_cache=False
             )
-            # 只处理 [PRED] 部分
-            h_pred_positions = h_dec[:, n_prompt:, :]
-            logits_pred = self.proj_head(h_pred_positions)
-            entropy = self._calc_entropy(logits_pred)  # (B, K)
+            h_pred_positions = h_dec[:, n_prompt:, :]  # (B, fixed_span_length, hidden)
 
-            M_t = torch.where(active_mask, torch.full((B,), M_step, device=device), torch.zeros(B, device=device))
-            pick_mask = self._select_top_m_positions(entropy, filled_mask, M_t)
+            # 使用 Proj Head 对 span 最后一个 token 进行预测，判断是否出现 <|TBD|>
+            logits_last = self.proj_head(h_pred_positions[:, -1, :]) / temperature
+            tokens_last = sample_from_logits(logits_last, temperature, top_p)  # (B,)
+            finished = tokens_last == self.config.tbd_token_id
+            # 更新活动 mask：未结束的仍为 active
+            active_mask = active_mask & (~finished)
+            iteration_count[active_mask] += 1
 
-            # Encoder refinement：更新隐状态 z
-            z = self.encoder.step(z, h_pred_positions.detach(), n_prompt)
+            # 更新整个 span 的预测（仅对活跃样本更新）
+            logits_span = self.proj_head(h_pred_positions) / temperature  # (B, fixed_span_length, vocab)
+            B_, L, V = logits_span.size()
+            logits_span_flat = logits_span.view(-1, V)
+            tokens_flat = sample_from_logits(logits_span_flat, temperature, top_p)
+            tokens_span = tokens_flat.view(B_, L)
+            seq_span = seq[:, n_prompt:]
+            seq_span[active_mask] = tokens_span[active_mask]
+            seq[:, n_prompt:] = seq_span
 
-            if pick_mask.any():
-                z_picked = z[pick_mask]
-                logits_picked = self.proj_head(z_picked) / temperature
-                tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
-                seq_updated = seq.clone()
-                seq_span = seq_updated[:, n_prompt:]
-                seq_span[pick_mask] = tokens_picked
-                seq_updated[:, n_prompt:] = seq_span
-                seq = seq_updated
-                filled_mask = filled_mask | pick_mask
+            # Encoder 根据当前预测进行隐状态更新
+            z = self.encoder.step(self.token_emb(seq[:, n_prompt:]), h_pred_positions.detach(), n_prompt)
 
-            avg_entropy = entropy.mean(dim=-1, keepdim=True)  # (B,1)
-            decision, gate_logits = self.gate_net(avg_entropy, train=self.training)
-
-            decision_active = (decision == 1)
-            new_active = active_mask.clone()
-            new_active[active_mask] = decision_active[active_mask]
-            to_increment = active_mask & decision_active
-            iteration_count[to_increment] += 1
-            active_mask = new_active
-
-        # 无论循环是否提前退出，均统一计算 final_logits
         final_logits = self.proj_head(z)
-
         return {
             'seq': seq,
             'logits_span': final_logits,
             'g_hat': iteration_count  # 每个样本的实际迭代步数
         }
-
-    def forward(self,
-                seq_prompt: torch.Tensor,
-                K: int,
-                gold_span: torch.Tensor = None,
-                temperature: float = 1.0,
-                top_p: float = 0.9):
-        # 仅使用 Student 路径
-        return self.span_forward_pass(seq_prompt, K, temperature=temperature, top_p=top_p)
