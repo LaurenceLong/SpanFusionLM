@@ -1,9 +1,10 @@
-# SpanFusionLM/modules/decoder.py
+# modules/decoder.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import math
+
 from .rope import RotaryEmbedding, apply_rotary_pos_emb
+
 
 class LlamaMLP(nn.Module):
     def __init__(self, hidden_size, intermediate_size):
@@ -171,6 +172,7 @@ class SpanDecoder(nn.Module):
                 hidden_states: torch.Tensor,
                 attention_mask: torch.Tensor = None,
                 position_ids: torch.Tensor = None,
+                padding_mask: torch.Tensor = None,
                 past_key_values=None,
                 use_cache: bool = True):
 
@@ -198,7 +200,38 @@ class SpanDecoder(nn.Module):
                 device,
                 hidden_states.dtype
             )
+        if padding_mask is not None:
+            if padding_mask.ndim != 2 or padding_mask.shape[0] != batch_size:
+                raise ValueError("Provided padding_mask must be 2D (batch_size, kv_sequence_length)")
 
+            # The key/value sequence length for the current forward pass
+            # If past_key_values are used, the full key/value sequence length includes past_kv_length
+            current_kv_seq_len = past_kv_length + seq_length
+
+            if padding_mask.shape[1] != current_kv_seq_len:
+                # This can happen if padding_mask only covers current tokens, not past ones.
+                # Assuming padding_mask covers the full effective sequence length (past + current)
+                # If model.py passes padding_mask for `seq` (length `seq_length` + `past_kv_length`), then this is fine.
+                # If model.py passes padding_mask for current `hidden_states` (length `seq_length`), then:
+                if padding_mask.shape[1] == seq_length and past_kv_length > 0:
+                    # Prepend 'not padded' for past keys/values, assuming they were valid
+                    past_padding = torch.zeros((batch_size, past_kv_length), dtype=torch.bool, device=device)
+                    padding_mask = torch.cat((past_padding, padding_mask), dim=1)
+                elif padding_mask.shape[1] != current_kv_seq_len:
+                    raise ValueError(
+                        f"Padding mask seq len {padding_mask.shape[1]} doesn't match "
+                        f"KV seq len {current_kv_seq_len}"
+                    )
+
+            # Expand the 2D padding mask (True for padded) to 4D
+            # Masked positions (True in padding_mask) should be -inf in final_attention_mask
+            expanded_padding_mask = padding_mask[:, None, None, :].expand(
+                batch_size, 1, seq_length, current_kv_seq_len
+            )
+            attention_mask = attention_mask.masked_fill(
+                expanded_padding_mask,  # Where True (is a pad token)
+                float("-inf")
+            )
         # 通过所有层
         all_present_key_values = [] if use_cache else None
 

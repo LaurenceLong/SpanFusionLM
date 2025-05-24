@@ -1,8 +1,7 @@
 # model.py
-from dataclasses import dataclass, field, asdict
 import json
+from dataclasses import dataclass, field, asdict
 from pathlib import Path
-from typing import Optional, Callable
 
 import torch
 import torch.nn as nn
@@ -168,14 +167,13 @@ class SpanFusionLM(nn.Module):
 
             embeddings = self.token_emb(seq)
             position_ids = torch.arange(seq.shape[1], device=device).unsqueeze(0).expand(B, -1)
-            attention_mask = (seq != self.config.pad_token_id).bool()
-            extended_attention_mask = attention_mask.unsqueeze(1).expand(seq.shape[0], seq.shape[1],
-                                                                         seq.shape[1]).unsqueeze(1)
+            padding_mask = (seq != self.config.pad_token_id).bool()
 
             h_dec, _ = self.decoder(
                 hidden_states=embeddings,
+                attention_mask=None,
                 position_ids=position_ids,
-                attention_mask=extended_attention_mask,
+                padding_mask=padding_mask,
                 past_key_values=None,
                 use_cache=False
             )

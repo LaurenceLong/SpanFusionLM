@@ -46,16 +46,18 @@ def generate(args):
     generated_tokens = 0
 
     def fast_override_fn(entropy_tensor):
+        # 始终输出“停止”=0 的低分
         batch_size = entropy_tensor.size(0)
-        target_logits = torch.full((batch_size, model.config.g_max), -100.0, device=entropy_tensor.device, dtype=torch.float)
-        target_logits[:, 0] = 100.0
-        return target_logits
+        # shape = (batch, 2)
+        logits = torch.tensor([[+1e9, -1e9]], device=entropy_tensor.device, dtype=torch.float)
+        return logits.expand(batch_size, 2)
 
     def accurate_override_fn(entropy_tensor):
+        # 始终输出“停止”=0 的低分
         batch_size = entropy_tensor.size(0)
-        target_logits = torch.full((batch_size, model.config.g_max), -100.0, device=entropy_tensor.device, dtype=torch.float)
-        target_logits[:, model.config.g_max - 1] = 100.0
-        return target_logits
+        # shape = (batch, 2)
+        logits = torch.tensor([[-1e9, +1e9]], device=entropy_tensor.device, dtype=torch.float)
+        return logits.expand(batch_size, 2)
 
     print(f"Starting generation with K={args.K}, mode='{args.generation_mode}'...")
 
@@ -87,8 +89,7 @@ def generate(args):
                 prompt_for_span,
                 K_to_generate,
                 temperature=args.temperature,
-                top_p=args.top_p,
-                g_override=None
+                top_p=args.top_p
             )
 
             newly_generated_part = out['seq'][:, current_seq_len : current_seq_len + K_to_generate]

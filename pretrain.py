@@ -12,6 +12,7 @@ import wandb
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from datasets import load_dataset
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import get_scheduler
@@ -32,16 +33,16 @@ def parse_args():
     parser.add_argument("--eval_split", type=str, default="test", help="Eval split")
     parser.add_argument("--max_seq_length", type=int, default=512, help="Max sequence length")
 
-    # Model args (调整为 GPT-2 small 级别配置)
+    # Model args (以 GPT-2 small 为例)
     parser.add_argument("--tokenizer_name", type=str, default="gpt2", help="Tokenizer name")
     parser.add_argument("--hidden_size", type=int, default=768, help="Hidden size (GPT-2 small configuration)")
     parser.add_argument("--intermediate_size", type=int, default=3072, help="Intermediate size (GPT-2 small configuration)")
-    parser.add_argument("--num_decoder_layers", type=int, default=12, help="Decoder layers (GPT-2 small configuration)")
-    parser.add_argument("--num_encoder_layers", type=int, default=6, help="Encoder layers (set to about half of decoder layers)")
+    parser.add_argument("--num_decoder_layers", type=int, default=8, help="Decoder layers (GPT-2 small configuration)")
+    parser.add_argument("--num_encoder_layers", type=int, default=4, help="Encoder layers (set to about half of decoder layers)")
     parser.add_argument("--num_attention_heads", type=int, default=12, help="Attention heads (GPT-2 small configuration)")
     parser.add_argument("--rope_theta", type=float, default=10000.0, help="RoPE theta")
     parser.add_argument("--g_max", type=int, default=4, help="Max GateNet iterations")
-    parser.add_argument("--span_lengths_str", type=str, default="8,16", help="Span lengths")
+    parser.add_argument("--span_lengths_str", type=str, default="8,16", help="Comma-separated span lengths")
 
     # Training args
     parser.add_argument("--output_dir", type=str, default="./spanfusionlm_checkpoint", help="Output directory")
@@ -53,6 +54,7 @@ def parse_args():
     parser.add_argument("--beta_cost_g", type=float, default=0.05, help="Initial β·E[g] cost coefficient")
     parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision")
 
+    # 注意：现在 collate_fn 只加载文本并转为数字，因此可以用更大的 batch_size
     parser.add_argument("--batch_size_per_device", type=int, default=16, help="Batch size per device")
     parser.add_argument("--gradient_accumulation_steps", type=int, default=4, help="Gradient accumulation steps")
     parser.add_argument("--num_train_epochs", type=int, default=1, help="Training epochs")
@@ -75,34 +77,26 @@ def parse_args():
     return args
 
 
-def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_id):
-    seq_prompts_list, gold_spans_list = [], []
+def simple_collate_fn(batch_samples, tokenizer, max_seq_len, pad_token_id):
+    """
+    简单地将 batch 中的文本加载并转换为数字（token id），不进行 prompt–span 划分。
+    每个样本返回一条 token 序列（未 pad），后续训练中会针对每条数据进行 next_span 切分。
+    """
+    token_seqs = []
     for sample in batch_samples:
         text = sample.get("text", "")
         if not isinstance(text, str) or len(text.strip()) < 50:
             continue
-        tokens = tokenizer.encode(text, add_special_tokens=False, max_length=max_seq_len + fixed_K_value + 50, truncation=True)
-        if len(tokens) < fixed_K_value + 20:
+        tokens = tokenizer.encode(
+            text,
+            add_special_tokens=False,
+            max_length=max_seq_len,
+            truncation=True
+        )
+        if len(tokens) == 0:
             continue
-        max_prompt_len = min(max_seq_len - fixed_K_value, len(tokens) - fixed_K_value)
-        if max_prompt_len < 20:
-            continue
-        prompt_len = random.randint(20, max_prompt_len)
-        seq_prompt_toks = tokens[:prompt_len]
-        gold_span_toks = tokens[prompt_len:prompt_len + fixed_K_value]
-        if len(gold_span_toks) != fixed_K_value:
-            continue
-        seq_prompts_list.append(torch.tensor(seq_prompt_toks, dtype=torch.long))
-        gold_spans_list.append(torch.tensor(gold_span_toks, dtype=torch.long))
-    if not seq_prompts_list:
-        return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
-    padded_seq_prompts = torch.nn.utils.rnn.pad_sequence(
-        seq_prompts_list, batch_first=True, padding_value=pad_token_id
-    )
-    padded_gold_spans = torch.nn.utils.rnn.pad_sequence(
-        gold_spans_list, batch_first=True, padding_value=pad_token_id
-    )
-    return padded_seq_prompts, padded_gold_spans
+        token_seqs.append(torch.tensor(tokens, dtype=torch.long))
+    return token_seqs
 
 
 def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accelerator):
@@ -121,13 +115,13 @@ def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accele
         embeddings = unwrapped_model.token_emb(gold_input_ids)
         batch_size_ar, ar_seq_len = gold_input_ids.shape
         ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
-        attention_mask = (gold_input_ids != model_config.pad_token_id).bool()
-        extended_attention_mask = attention_mask.unsqueeze(1).expand(attention_mask.shape[0], attention_mask.shape[1],
-                                                                     attention_mask.shape[1]).unsqueeze(1)
+        padding_mask = (gold_input_ids != model_config.pad_token_id).bool()
+
         h_gold_ar, _ = unwrapped_model.decoder(
             hidden_states=embeddings,
+            attention_mask=None,
             position_ids=ar_pos_ids,
-            attention_mask=extended_attention_mask,
+            padding_mask=padding_mask,
             past_key_values=None,
             use_cache=False
         )
@@ -172,6 +166,7 @@ def main():
 
     tokenizer = build_tokenizer(args.tokenizer_name)
 
+    # 这里模型配置里的 max_position_embeddings 取 max_seq_length + max(span_lengths)
     max_k_val = max(args.span_lengths)
     config_max_pos_embeddings = args.max_seq_length + max_k_val
 
@@ -191,6 +186,10 @@ def main():
 
     logger.info(f"Model config: {model_config}")
     model = SpanFusionLM(model_config)
+    logger.info(f"模型结构: {model}")
+
+    total_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    logger.info(f"可训练参数总数: {total_params}")
 
     optimizer = optim.AdamW(
         model.parameters(),
@@ -204,15 +203,15 @@ def main():
     raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
     train_dataset = raw_datasets[args.train_split]
 
-    def train_collate_wrapper(batch_samples):
-        current_K = random.choice(args.span_lengths)
-        return collate_fn(batch_samples, tokenizer, current_K, args.max_seq_length, model_config.pad_token_id)
+    # 使用简单的 collate_fn 仅加载 token 数字序列
+    def collate_wrapper(batch_samples):
+        return simple_collate_fn(batch_samples, tokenizer, args.max_seq_length, model_config.pad_token_id)
 
     train_dataloader = DataLoader(
         train_dataset,
         batch_size=args.batch_size_per_device,
         shuffle=True,
-        collate_fn=train_collate_wrapper,
+        collate_fn=collate_wrapper,
         drop_last=True,
         num_workers=args.num_workers
     )
@@ -243,18 +242,51 @@ def main():
 
     for epoch in range(args.num_train_epochs):
         for step, batch_data in enumerate(train_dataloader):
-            if batch_data is None or batch_data[0].size(0) == 0:
+            # batch_data 为一个列表，每个元素是一条 token 序列（1D tensor）
+            if not batch_data or len(batch_data) == 0:
                 continue
 
-            if completed_steps >= args.max_train_steps:
-                break
+            # 随机选择一个当前的 span 长度，用于本个 batch 内所有样本
+            current_K = random.choice(args.span_lengths)
+            all_prompts = []
+            all_spans = []
 
-            seq_prompt, gold_span = batch_data
-            current_K = gold_span.shape[1]
+            for seq in batch_data:
+                T = seq.size(0)
+                # 如果序列长度不足以生成 prompt 和 span，则略过
+                if T < current_K + 1:
+                    continue
+
+                # 计算可选的最大初始 prompt 长度，保证后续有足够空间划分 span，
+                # 此处取三个值中的最小值：文中剩余长度、允许的最大长度、以及 fixed_K 自身
+                max_initial = min(T - current_K, args.max_seq_length - current_K, current_K)
+                if max_initial < 1:
+                    continue
+
+                prompt_len = random.randint(1, max_initial)
+                idx = prompt_len
+                # 对当前序列多次生成 prompt–span 对
+                while idx + current_K <= T and idx + current_K <= args.max_seq_length:
+                    prompt_tokens = seq[:idx]
+                    span_tokens = seq[idx: idx + current_K]
+                    all_prompts.append(prompt_tokens)
+                    all_spans.append(span_tokens)
+                    idx += current_K
+
+            if len(all_prompts) == 0:
+                continue
+
+            # 对所有生成的 prompt 序列进行 pad，span 序列固定长度直接 stack
+            padded_seq_prompts = pad_sequence(
+                all_prompts,
+                batch_first=True,
+                padding_value=model_config.pad_token_id
+            )
+            padded_gold_spans = torch.stack(all_spans, dim=0)
 
             with accelerator.accumulate(model):
                 losses, output = compute_losses(
-                    model, seq_prompt, gold_span, current_K, model_config, accelerator
+                    model, padded_seq_prompts, padded_gold_spans, current_K, model_config, accelerator
                 )
 
                 g_loss = args.beta_cost_g * output["g_hat"].float().mean()
@@ -262,7 +294,7 @@ def main():
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     skip_count += 1
-                    logger.warning(f"Invalid loss detected: {total_loss}, skipping step")
+                    logger.warning(f"Invalid loss detected: {total_loss}, skipping batch")
                     continue
 
                 accelerator.backward(total_loss)
@@ -270,7 +302,6 @@ def main():
                 if accelerator.sync_gradients:
                     if args.grad_clip > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
-
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
@@ -287,14 +318,14 @@ def main():
                             "loss_ar": losses['ar'].item(),
                             "loss_token": losses['token'].item(),
                             "loss_g": g_loss,
-                            "g_avg": g_avg,  # 添加当前 step 的 g 的平均值
+                            "g_avg": g_avg,
                             "step": completed_steps,
                             "skip_count": skip_count,
                         }
 
                         if accelerator.is_main_process and not args.disable_wandb:
                             wandb.log(loss_log, step=completed_steps)
-                        logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR_loss={losses['ar'].item():.4f}, Token_loss={losses['token'].item():.4f}, G_loss={g_loss:.4f} , G_avg={g_avg:.4f}")
+                        logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR_loss={losses['ar'].item():.4f}, Token_loss={losses['token'].item():.4f}, G_loss={g_loss:.4f}, G_avg={g_avg:.4f}")
 
                     if completed_steps % args.save_steps == 0:
                         if accelerator.is_main_process:
@@ -322,8 +353,8 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process and not args.disable_wandb:
         wandb.finish()
-    logger.info(f"Training complete. Total skipped steps: {skip_count}")
+    logger.info(f"Training complete. Total skipped batches: {skip_count}")
+
 
 if __name__ == "__main__":
-    torch.autograd.set_detect_anomaly(True)
     main()
