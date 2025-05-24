@@ -50,7 +50,7 @@ def parse_args():
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
     parser.add_argument("--adam_beta2", type=float, default=0.99, help="Adam beta2")
     parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
-    parser.add_argument("--beta_cost_g", type=float, default=0.01, help="Initial β·E[g] cost coefficient")
+    parser.add_argument("--beta_cost_g", type=float, default=0.05, help="Initial β·E[g] cost coefficient")
     parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision")
 
     parser.add_argument("--batch_size_per_device", type=int, default=16, help="Batch size per device")
@@ -95,7 +95,7 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
         seq_prompts_list.append(torch.tensor(seq_prompt_toks, dtype=torch.long))
         gold_spans_list.append(torch.tensor(gold_span_toks, dtype=torch.long))
     if not seq_prompts_list:
-        return None
+        return torch.empty(0, dtype=torch.long), torch.empty(0, dtype=torch.long)
     padded_seq_prompts = torch.nn.utils.rnn.pad_sequence(
         seq_prompts_list, batch_first=True, padding_value=pad_token_id
     )
@@ -106,70 +106,48 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
 
 
 def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accelerator):
-    try:
-        model.gate_net.override(None)
-        student_out = model(
-            seq_prompt,
-            current_K,
-            gold_span=gold_span,
-            compute_teacher_latent=True
+    output = model(seq_prompt, current_K, gold_span=gold_span)
+    unwrapped_model = accelerator.unwrap_model(model)
+    losses = {}
+
+    gold_full_seq = torch.cat([seq_prompt, gold_span], dim=1)
+    if gold_full_seq.shape[1] > model_config.max_position_embeddings:
+        gold_full_seq = gold_full_seq[:, :model_config.max_position_embeddings]
+
+    gold_input_ids = gold_full_seq[:, :-1]
+    gold_target_ids = gold_full_seq[:, 1:]
+
+    if gold_input_ids.shape[1] > 0:
+        embeddings = unwrapped_model.token_emb(gold_input_ids)
+        batch_size_ar, ar_seq_len = gold_input_ids.shape
+        ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
+        attention_mask = (gold_input_ids != model_config.pad_token_id).bool()
+        extended_attention_mask = attention_mask.unsqueeze(1).expand(attention_mask.shape[0], attention_mask.shape[1],
+                                                                     attention_mask.shape[1]).unsqueeze(1)
+        h_gold_ar, _ = unwrapped_model.decoder(
+            hidden_states=embeddings,
+            position_ids=ar_pos_ids,
+            attention_mask=extended_attention_mask,
+            past_key_values=None,
+            use_cache=False
         )
-        unwrapped_model = accelerator.unwrap_model(model)
-        losses = {}
+        logits_ar = unwrapped_model.proj_head(h_gold_ar)
+        losses['ar'] = F.cross_entropy(
+            logits_ar.reshape(-1, model_config.vocab_size),
+            gold_target_ids.reshape(-1),
+            ignore_index=model_config.pad_token_id
+        )
+    else:
+        losses['ar'] = torch.tensor(0.0, device=accelerator.device)
 
-        gold_full_seq = torch.cat([seq_prompt, gold_span], dim=1)
-        if gold_full_seq.shape[1] > model_config.max_position_embeddings:
-            gold_full_seq = gold_full_seq[:, :model_config.max_position_embeddings]
+    # 使用 output 中的 logits_span 计算 token 预测 loss
+    losses['token'] = F.cross_entropy(
+        output['logits_span'].reshape(-1, model_config.vocab_size),
+        gold_span.reshape(-1),
+        ignore_index=model_config.pad_token_id
+    )
 
-        gold_input_ids = gold_full_seq[:, :-1]
-        gold_target_ids = gold_full_seq[:, 1:]
-
-        if gold_input_ids.shape[1] > 0:
-            embeddings = unwrapped_model.token_emb(gold_input_ids)
-            batch_size_ar, ar_seq_len = gold_input_ids.shape
-            ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
-            h_gold_ar, _ = unwrapped_model.decoder(
-                hidden_states=embeddings,
-                position_ids=ar_pos_ids,
-                past_key_values=None,
-                use_cache=False
-            )
-            logits_ar = unwrapped_model.proj_head(h_gold_ar)
-            losses['ar'] = F.cross_entropy(
-                logits_ar.reshape(-1, model_config.vocab_size),
-                gold_target_ids.reshape(-1),
-                ignore_index=model_config.pad_token_id
-            )
-        else:
-            losses['ar'] = torch.tensor(0.0, device=accelerator.device)
-
-        if unwrapped_model.z_pred_for_loss is not None and unwrapped_model.z_teacher_for_loss is not None:
-            z_s = F.layer_norm(unwrapped_model.z_pred_for_loss, (unwrapped_model.config.hidden_size,))
-            z_t = F.layer_norm(unwrapped_model.z_teacher_for_loss, (unwrapped_model.config.hidden_size,))
-            losses['latent'] = 0.5 * (1 - F.cosine_similarity(z_s, z_t, dim=-1)).mean()
-        else:
-            losses['latent'] = torch.tensor(0.0, device=accelerator.device)
-
-        if unwrapped_model.logits_span_for_loss is not None:
-            losses['token'] = F.cross_entropy(
-                unwrapped_model.logits_span_for_loss.reshape(-1, model_config.vocab_size),
-                gold_span.reshape(-1),
-                ignore_index=model_config.pad_token_id
-            )
-        else:
-            losses['token'] = torch.tensor(0.0, device=accelerator.device)
-
-        # 期望计算成本使用实际的迭代步数
-        if student_out['g_hat'] is not None:
-            losses['exp_g'] = student_out['g_hat'].float().mean()
-        else:
-            losses['exp_g'] = torch.tensor(0.0, device=accelerator.device)
-
-        return losses, True
-
-    except Exception as e:
-        logger.error(f"Error in loss computation: {e}")
-        return None, False
+    return losses, output
 
 
 def main():
@@ -265,37 +243,22 @@ def main():
 
     for epoch in range(args.num_train_epochs):
         for step, batch_data in enumerate(train_dataloader):
+            if batch_data is None or batch_data[0].size(0) == 0:
+                continue
+
             if completed_steps >= args.max_train_steps:
                 break
-
-            if batch_data is None:
-                continue
 
             seq_prompt, gold_span = batch_data
             current_K = gold_span.shape[1]
 
             with accelerator.accumulate(model):
-                loss_result, success = compute_losses(
+                losses, output = compute_losses(
                     model, seq_prompt, gold_span, current_K, model_config, accelerator
                 )
 
-                if not success or loss_result is None:
-                    skip_count += 1
-                    if skip_count % 10 == 0:
-                        logger.warning(f"Skipped {skip_count} steps due to errors")
-                    continue
-
-                losses = loss_result
-
-                # Curriculum: 逐步上升成本惩罚权重
-                current_beta = min(0.05, completed_steps / 30000 * 0.05)
-
-                total_loss = (
-                    0.4 * losses['ar'] +
-                    0.4 * losses['token'] +
-                    0.2 * losses['latent'] +
-                    current_beta * losses['exp_g']
-                )
+                g_loss = args.beta_cost_g * output["g_hat"].float().mean()
+                total_loss = 0.5 * losses['ar'] + 0.5 * losses['token'] + g_loss
 
                 if torch.isnan(total_loss) or torch.isinf(total_loss):
                     skip_count += 1
@@ -317,20 +280,21 @@ def main():
                     progress_bar.set_postfix(loss=f"{total_loss.item():.4f}")
 
                     if completed_steps % args.logging_steps == 0:
+                        g_avg = output["g_hat"].float().mean().item()
                         loss_log = {
                             "train_loss": total_loss.item(),
                             "lr": lr_scheduler.get_last_lr()[0],
                             "loss_ar": losses['ar'].item(),
-                            "loss_latent": losses['latent'].item(),
                             "loss_token": losses['token'].item(),
-                            "exp_g": losses['exp_g'].item(),
+                            "loss_g": g_loss,
+                            "g_avg": g_avg,  # 添加当前 step 的 g 的平均值
                             "step": completed_steps,
                             "skip_count": skip_count,
                         }
 
                         if accelerator.is_main_process and not args.disable_wandb:
                             wandb.log(loss_log, step=completed_steps)
-                        logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR={losses['ar'].item():.4f}, Latent={losses['latent'].item():.4f}, Token={losses['token'].item():.4f}, Exp_g={losses['exp_g'].item():.4f}")
+                        logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR_loss={losses['ar'].item():.4f}, Token_loss={losses['token'].item():.4f}, G_loss={g_loss:.4f} , G_avg={g_avg:.4f}")
 
                     if completed_steps % args.save_steps == 0:
                         if accelerator.is_main_process:

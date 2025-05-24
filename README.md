@@ -39,103 +39,57 @@
 ---
 
 ## 3. 前向核心逻辑 (`span_forward_pass` 简化伪码 - 贴合实现)
+## 3. 前向核心逻辑 (`span_forward_pass` 关键数据流)
 
-```python
-# config: SpanFusionLMConfig
-# self: SpanFusionLM instance
+此函数的核心是通过迭代细化来生成一段指定长度的文本。
 
-def span_forward_pass(seq_prompt, K, temperature, top_p, is_teacher_path):
-    B, n_prompt = seq_prompt.shape
-    device = seq_prompt.device
-    PRED_ID = self.config.pred_token_id
-    g_max = self.config.g_max
+**输入:**
 
-    # 初始化 GateNet override (训练时设为 None)
-    if self.training: self.gate_net.override(None)
+*   `seq_prompt`: 初始的文本序列。
+*   `K`: 要生成的文本片段长度。
 
-    # 初始序列: prompt + K 个 [PRED]
-    pred_tokens = torch.full((B, K), PRED_ID, dtype=torch.long, device=device)
-    seq = torch.cat([seq_prompt, pred_tokens], dim=1)
+**内部模块:**
 
-    filled_mask = torch.zeros(B, K, dtype=torch.bool, device=device) # 记录已填充位置
-    iteration_count = torch.zeros(B, device=device, dtype=torch.long) # 实际迭代次数 g_hat
-    active_mask = torch.ones(B, dtype=torch.bool, device=device) # 哪些样本在迭代
+*   `TokenEmbedding`: 将 token ID 转换为向量表示。
+*   `SpanDecoder`: 自回归解码器，预测序列中下一个 token 的概率分布。
+*   `SpanEncoder`: 用于细化文本片段的隐状态表示。
+*   `ProjectionHead`: 将隐状态向量转换回 token 的 logits。
+*   `GateNet`: 动态决定是否继续迭代细化。
 
-    # 每步固定更新 M_step 个 token (向上取整)
-    M_step = (K + g_max - 1) // g_max
+**关键数据流与处理步骤:**
 
-    # 初始化隐状态 z 为 [PRED] token 的嵌入
-    z = self.token_emb(pred_tokens)
-    final_z, final_logits, gate_logits_output = None, None, None
+1.  **初始化:**
+    *   `seq_prompt` 后追加 `K` 个占位符，形成当前工作序列 `seq`。
+    *   占位符通过 `TokenEmbedding` 得到初始隐状态 `z`。
+    *   创建 `filled_mask` (标记哪些位置已填充) 和 `active_mask` (标记哪些样本仍在迭代)。
 
-    for t in range(g_max):
-        if not active_mask.any(): break
+2.  **迭代细化循环 (固定最大轮次):**
+    *   **A. 初步预测与不确定性评估:**
+        *   当前 `seq` -> `TokenEmbedding` -> `SpanDecoder` -> 得到整个序列的隐状态 `h_dec`。
+        *   `h_dec` 中对应 `K` 个待填充位置的部分 -> `ProjectionHead` -> `logits_pred`。
+        *   `logits_pred` 计算得到每个位置的熵 (不确定性)。
+    *   **B. 选择更新位置:**
+        *   根据熵和 `filled_mask`，在未填充位置中选择若干最不确定的位置 (`pick_mask`)。
+    *   **C. 隐状态细化:**
+        *   当前 `z` 和 `h_dec` (对应 `K` 个位置的部分) -> `SpanEncoder` -> 更新 `z`。
+    *   **D. Token 生成与回写:**
+        *   从更新后的 `z` 中，根据 `pick_mask` 选出对应位置的隐状态 -> `ProjectionHead` -> `logits_picked`。
+        *   `logits_picked` -> (采样或 argmax) -> `tokens_picked`。
+        *   使用 `tokens_picked` 更新 `seq` 中的相应位置，并同步更新 `filled_mask`。
+    *   **E. 动态迭代决策:**
+        *   当前 `K` 个位置的平均熵 -> `GateNet` -> 决策 (继续/停止迭代)。
+        *   根据决策更新 `active_mask`。若某样本决策为停止，则后续不再对其细化。
 
-        # 1. Decoder 全量前向 (对当前整个 seq)
-        embeddings = self.token_emb(seq)
-        pos_ids = torch.arange(seq.shape[1], device=device).unsqueeze(0)
-        h_dec, _ = self.decoder(embeddings, position_ids=pos_ids, use_cache=False)
-        h_pred_positions = h_dec[:, n_prompt:, :] # 取 K 个 PRED 位置的隐状态
-        logits_pred = self.proj_head(h_pred_positions)
-        entropy = self._calc_entropy(logits_pred) # (B, K)
+3.  **输出准备:**
+    *   保存最终的 `z` (学生路径下用于损失计算的 `z_pred_for_loss`，教师路径下为 `z_teacher_for_loss`)。
+    *   学生路径下，最终的 `z` -> `ProjectionHead` -> `logits_span_for_loss`。
 
-        # 2. 确定本轮要更新的 token 数量 M_t (active 样本为 M_step, inactive 为 0)
-        M_t_per_sample = torch.where(active_mask, M_step, 0)
-        pick_mask = self._select_top_m_positions(entropy, filled_mask, M_t_per_sample) # (B,K) bool
+**输出:**
 
-        # 3. Encoder latent refinement (对所有 K 个位置的 z)
-        #    encoder.step 内部处理 RoPE 等细节
-        z = self.encoder.step(z, h_pred_positions.detach(), n_prompt)
-
-        # 4. 投射 pick 位置并写回序列
-        if pick_mask.any():
-            z_picked = z[pick_mask] # (num_picked, d)
-            logits_picked = self.proj_head(z_picked)
-            if is_teacher_path:
-                tokens_picked = torch.argmax(logits_picked, dim=-1)
-            else:
-                tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
-
-            # 更新 seq 和 filled_mask
-            seq_span_view = seq[:, n_prompt:]
-            seq_span_view[pick_mask] = tokens_picked
-            seq[:, n_prompt:] = seq_span_view
-            filled_mask = filled_mask | pick_mask
-
-        # 保存最后一次迭代的 z 和 logits (用于可能的损失计算或最终输出)
-        if t == g_max - 1:
-            final_z = z.clone()
-            final_logits = self.proj_head(z.clone()) # 使用更新后的 z
-
-        # 5. GateNet 决策是否继续迭代
-        avg_entropy = entropy.mean(dim=-1, keepdim=True) # (B, 1)
-        # GateNet 训练时: train=self.training AND not is_teacher_path
-        # GateNet 教师路径/推理时: train=False
-        decision, gate_logits = self.gate_net(avg_entropy,
-                                              train=(self.training and not is_teacher_path))
-        gate_logits_output = gate_logits # 保存用于返回
-
-        new_active = active_mask.clone()
-        new_active[active_mask] = (decision[active_mask] == 1) # 1=继续, 0=停止
-        iteration_count[active_mask] += 1 # 仍在迭代的样本，计数+1
-        active_mask = new_active
-
-    # 保存用于损失计算的特定隐状态
-    if is_teacher_path:
-        self.z_teacher_for_loss = z.detach().clone() # 使用循环结束时的 z
-    else:
-        self.z_pred_for_loss = z.clone() # 使用循环结束时的 z
-        self.logits_span_for_loss = self.proj_head(z) # 使用循环结束时的 z 计算 logits
-
-    return {
-        'seq': seq,
-        'z_pred': final_z if not is_teacher_path else None, # 学生路径下最后一步的 z
-        'logits_span': final_logits if not is_teacher_path else None, # 学生路径下最后一步的 logits
-        'p_g': F.softmax(gate_logits_output, dim=-1) if gate_logits_output is not None else None,
-        'g_hat': iteration_count # 每个样本的实际迭代步数
-    }
-```
-
+*   最终生成的完整序列 `seq`。
+*   学生路径下，用于损失计算的 `z_pred_for_loss` 和 `logits_span_for_loss`。
+*   教师路径下，用于损失计算的 `z_teacher_for_loss`。
+*   `GateNet` 的决策相关信息 (如实际迭代次数 `g_hat`)。
 ---
 
 ## 4. 损失定义 (`compute_losses` 函数)
@@ -241,51 +195,37 @@ L_total = 0.4·L_AR + 0.2·L_latent + 0.4·L_token + β_cost_g·E[g_hat]
 
 ## 8. 推理接口 (`infer.py` - 示意，与方案对齐)
 
-```python
-# infer.py (概念对齐，实际代码可能更复杂)
-# from .model import SpanFusionLM, SpanFusionLMConfig
-# from .modules.tokenizer import build_tokenizer
+此函数的核心是利用 `span_forward_pass` 核心逻辑，自回归地生成指定长度的新文本。
 
-# def generate(prompt_text, max_new_tokens, K_value, model, tokenizer, config,
-#              temperature=0.8, top_p=0.9, gate_override_mode=None):
-#     seq_prompt = tokenizer.encode(prompt_text, return_tensors="pt").to(model.device)
-#     generated_sequence = seq_prompt.clone()
-#
-#     # GateNet override logic based on gate_override_mode
-#     # Example: if gate_override_mode == 'fast':
-#     # model.gate_net.override(lambda entropy_feature: torch.tensor([[0.0, 1.0]] * entropy_feature.shape[0], device=model.device)) # Force continue (effectively g=1 if M_step fills K)
-#     # elif gate_override_mode == 'accurate':
-#     # model.gate_net.override(lambda entropy_feature: torch.tensor([[1.0, 0.0]] * entropy_feature.shape[0], device=model.device)) # Force stop after 1st (effectively g=g_max if M_step is small)
-#     # else: model.gate_net.override(None) # Use learned GateNet
-#
-#     current_len = seq_prompt.shape[1]
-#     target_len = current_len + max_new_tokens
-#
-#     while current_len < target_len:
-#          K_to_generate = min(K_value, target_len - current_len)
-#          if K_to_generate == 0: break
-#
-#         # Call the model's forward or span_forward_pass directly for inference
-#         # Note: In actual infer.py, it would call model.generate or a similar high-level method
-#         # which internally calls span_forward_pass.
-#         # For this alignment, assume span_forward_pass is used:
-#         output_dict = model.span_forward_pass(
-#             generated_sequence,
-#             K_to_generate,
-#             temperature=temperature,
-#             top_p=top_p,
-#             is_teacher_path=False # Inference is like student path but with argmax/sampling
-#         )
-#         # The 'seq' from output_dict contains the prompt + K generated tokens
-#         # We need to handle how 'seq' is formed if K_to_generate < K capacity of span_forward_pass
-#         # Assuming output_dict['seq'] is [B, L_prompt + K_generated]
-#         generated_sequence = output_dict['seq']
-#         current_len = generated_sequence.shape[1]
-#
-#     return tokenizer.decode(generated_sequence[0])
+**输入:**
 
-```
-**注**: `infer.py` 的实际 `generate` 函数会更复杂，处理 token 拼接、EOS 等。上述伪码仅为对齐 `span_forward_pass` 和 `GateNet.override` 的概念。代码中 `GateNet.override(None)` 会在 `span_forward_pass` 开始时被调用（如果 `self.training`），推理时需要手动设置。
+*   `prompt_text`: 用户提供的初始文本。
+*   `max_new_tokens`: 希望生成的最大新 token 数量。
+*   `K_value`: 每次调用 `span_forward_pass` 时尝试生成的片段长度。
+*   `model`: 预训练好的 `SpanFusionLM` 模型实例。
+*   `tokenizer`: 用于文本编解码。
+*   (可选) `gate_override_mode`: 控制 `GateNet` 行为的模式。
+
+**关键数据流与处理步骤:**
+
+1.  **初始化:**
+    *   `prompt_text` -> `tokenizer` -> 初始 `generated_sequence`。
+    *   (可选) 根据 `gate_override_mode` 设置 `model.gate_net` 的行为 (例如，强制快速或强制精确)。
+
+2.  **自回归生成循环 (直到达到 `max_new_tokens`):**
+    *   确定本次迭代要生成的片段长度 `K_to_generate` (不超过 `K_value` 和剩余需生成长度)。
+    *   **调用核心生成逻辑:**
+        *   当前 `generated_sequence` 和 `K_to_generate` -> `model.span_forward_pass` (推理模式，无教师路径)。
+        *   `model.span_forward_pass` 返回包含新生成片段的 `output_dict`。
+    *   **更新生成序列:**
+        *   从 `output_dict` 中提取包含新生成 token 的完整序列，更新 `generated_sequence`。
+
+3.  **输出准备:**
+    *   最终的 `generated_sequence` -> `tokenizer` -> 解码为文本。
+
+**输出:**
+
+*   包含原始 prompt 和所有新生成 token 的完整文本字符串。
 
 ---
 

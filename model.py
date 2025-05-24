@@ -1,7 +1,8 @@
 # model.py
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import json
 from pathlib import Path
+from typing import Optional, Callable
 
 import torch
 import torch.nn as nn
@@ -37,12 +38,7 @@ def sample_from_logits(logits: torch.Tensor, temperature: float = 1.0, top_p: fl
     probs = torch.softmax(logits, dim=-1)
     if torch.isnan(probs).any() or torch.isinf(probs).any():
         return torch.argmax(logits, dim=-1)
-    try:
-        if probs.ndim == 1:
-            return torch.multinomial(probs.unsqueeze(0), num_samples=1).squeeze()
-        return torch.multinomial(probs, num_samples=1).squeeze(-1)
-    except:
-        return torch.argmax(logits, dim=-1)
+    return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 
 @dataclass
@@ -69,21 +65,25 @@ class SpanFusionLMConfig:
             self.tokenizer = build_tokenizer(self.tokenizer_name)
         if self.vocab_size is None or self.vocab_size == 32000:
             self.vocab_size = len(self.tokenizer)
-        if hasattr(self.tokenizer, 'additional_special_tokens') and '<|PRED|>' in self.tokenizer.additional_special_tokens:
+        # 确保特殊 token <|PRED|> 已经被添加
+        if hasattr(self.tokenizer, 'additional_special_tokens'):
+            if '<|PRED|>' not in self.tokenizer.additional_special_tokens:
+                self.tokenizer.add_special_tokens({'additional_special_tokens': ['<|PRED|>']})
             self.pred_token_id = self.tokenizer.additional_special_tokens_ids[
                 self.tokenizer.additional_special_tokens.index('<|PRED|>')
             ]
+        else:
+            self.pred_token_id = self.pad_token_id  # fallback 如果没有 additional_special_tokens
         self.pad_token_id = self.tokenizer.pad_token_id
         self.bos_token_id = self.tokenizer.bos_token_id
         self.eos_token_id = self.tokenizer.eos_token_id
 
     def save_pretrained(self, save_directory: str):
+        config_dict = asdict(self)
+        config_dict.pop('tokenizer', None)
         path = Path(save_directory)
         path.mkdir(parents=True, exist_ok=True)
         config_file = path / "config.json"
-        config_dict = self.__dict__.copy()
-        if 'tokenizer' in config_dict:
-            del config_dict['tokenizer']
         with open(config_file, "w") as f:
             json.dump(config_dict, f, indent=2)
 
@@ -112,12 +112,7 @@ class SpanFusionLM(nn.Module):
             tied_embedding_weight=self.token_emb.embedding.weight
         )
         # 使用基于二分类的 GateNet
-        self.gate_net = GateNet(input_dim=1, hidden_dim=config.hidden_size // 16, g_max=config.g_max)
-
-        # 用于损失计算的临时变量
-        self.z_pred_for_loss = None
-        self.z_teacher_for_loss = None
-        self.logits_span_for_loss = None
+        self.gate_net = GateNet(input_dim=1, hidden_dim=config.hidden_size // 4)
 
     def _calc_entropy(self, logits: torch.Tensor):
         logits = torch.clamp(logits, min=-50, max=50)
@@ -128,77 +123,67 @@ class SpanFusionLM(nn.Module):
         return entropy
 
     def _select_top_m_positions(self, entropy: torch.Tensor, filled_mask: torch.Tensor, M_t: torch.Tensor):
-        B, K = entropy.shape
+        # 将已填充（更新过）的部分设为 -inf，
+        # 并选取剩余位置中熵值最高的前 max_M 个
+        masked_entropy = entropy.clone()
+        masked_entropy[filled_mask] = float('-inf')
+        max_M = int(M_t.max().item())
+        _, idxs = torch.topk(masked_entropy, k=max_M, largest=True, dim=-1)  # 选择最高熵的位置
         pick_mask = torch.zeros_like(filled_mask, dtype=torch.bool)
-        for b in range(B):
-            m_b = int(M_t[b].item())
-            if m_b <= 0:
-                continue
-            available_positions = (~filled_mask[b]).nonzero().flatten()
-            if len(available_positions) == 0:
-                continue
-            available_entropy = entropy[b, available_positions]
-            num_select = min(m_b, len(available_positions))
-            if num_select > 0:
-                _, selected_indices = torch.topk(available_entropy, num_select, largest=False)
-                selected_positions = available_positions[selected_indices]
-                pick_mask[b, selected_positions] = True
+        for m in range(max_M):
+            condition = (M_t > m).unsqueeze(-1)
+            pick_mask.scatter_(1, idxs[:, m:m+1], condition)
         return pick_mask
 
     def span_forward_pass(self,
                           seq_prompt: torch.Tensor,
                           K: int,
                           temperature: float = 1.0,
-                          top_p: float = 0.9,
-                          is_teacher_path: bool = False):
+                          top_p: float = 0.9):
         """
-        使用二分类GateNet实现动态迭代：每一步由GateNet根据当前平均熵决定是否继续迭代。
+        使用二分类 GateNet 实现动态迭代：
+        每一步由 GateNet 根据当前平均熵决定是否继续迭代。
         """
         B, n_prompt = seq_prompt.shape
         device = seq_prompt.device
 
-        # 重置 GateNet 的 override_fn
-        if self.training:
-            self.gate_net.override(None)
-
-        # 构建初始序列
+        # 构造初始序列：在 prompt 后附加 K 个 [PRED] 占位符
         pred_tokens = torch.full((B, K), self.config.pred_token_id, dtype=torch.long, device=device)
         seq = torch.cat([seq_prompt, pred_tokens], dim=1)
 
-        # 初始化填充掩码，记录哪些位置已更新
+        # 初始化填充掩码，记录哪些位置已被更新
         filled_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
-        # 初始化迭代计数（每个样本实际使用的迭代次数）
         iteration_count = torch.zeros(B, device=device, dtype=torch.long)
-        final_z = None
-        final_logits = None
 
-        # active_mask 表示哪些样本当前仍在迭代中（开始时全部active）
         active_mask = torch.ones(B, dtype=torch.bool, device=device)
         max_iters = self.config.g_max
-        # 固定每步更新的 token 数量（例如均分更新 K 个 token）
-        M_step = (K + max_iters - 1) // max_iters  # 向上取整
+        M_step = (K + max_iters - 1) // max_iters
 
-        # 初始化隐状态 z 为预测 token 的嵌入
+        # 初始化编码器输入 z
         z = self.token_emb(pred_tokens)
 
         for t in range(max_iters):
             if not active_mask.any():
                 break
 
-            # 全样本前向传播（后续更新只对active样本生效）
             embeddings = self.token_emb(seq)
             position_ids = torch.arange(seq.shape[1], device=device).unsqueeze(0).expand(B, -1)
+            attention_mask = (seq != self.config.pad_token_id).bool()
+            extended_attention_mask = attention_mask.unsqueeze(1).expand(seq.shape[0], seq.shape[1],
+                                                                         seq.shape[1]).unsqueeze(1)
+
             h_dec, _ = self.decoder(
                 hidden_states=embeddings,
                 position_ids=position_ids,
+                attention_mask=extended_attention_mask,
                 past_key_values=None,
                 use_cache=False
             )
+            # 只处理 [PRED] 部分
             h_pred_positions = h_dec[:, n_prompt:, :]
             logits_pred = self.proj_head(h_pred_positions)
             entropy = self._calc_entropy(logits_pred)  # (B, K)
 
-            # 对于 active 样本，每步计划更新 M_step 个 token，其余样本更新数为 0
             M_t = torch.where(active_mask, torch.full((B,), M_step, device=device), torch.zeros(B, device=device))
             pick_mask = self._select_top_m_positions(entropy, filled_mask, M_t)
 
@@ -208,11 +193,7 @@ class SpanFusionLM(nn.Module):
             if pick_mask.any():
                 z_picked = z[pick_mask]
                 logits_picked = self.proj_head(z_picked) / temperature
-                if is_teacher_path:
-                    tokens_picked = torch.argmax(logits_picked, dim=-1)
-                else:
-                    tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
-                # 更新对应位置的 token
+                tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
                 seq_updated = seq.clone()
                 seq_span = seq_updated[:, n_prompt:]
                 seq_span[pick_mask] = tokens_picked
@@ -220,33 +201,22 @@ class SpanFusionLM(nn.Module):
                 seq = seq_updated
                 filled_mask = filled_mask | pick_mask
 
-            # 保存最后一次迭代的隐状态和 logits（用于损失计算）
-            if t == max_iters - 1:
-                final_z = z.clone()
-                final_logits = self.proj_head(z.clone())
-
-            # 计算每个样本当前的平均熵，用于判断是否继续迭代
             avg_entropy = entropy.mean(dim=-1, keepdim=True)  # (B,1)
-            decision, gate_logits = self.gate_net(avg_entropy, train=self.training and not is_teacher_path)
-            # decision：1 表示继续，0 表示提前终止
+            decision, gate_logits = self.gate_net(avg_entropy, train=self.training)
+
+            decision_active = (decision == 1)
             new_active = active_mask.clone()
-            new_active[active_mask] = (decision[active_mask] == 1)
-            # 对于还选择继续的样本，本轮迭代计数加 1
-            iteration_count[active_mask] += 1
+            new_active[active_mask] = decision_active[active_mask]
+            to_increment = active_mask & decision_active
+            iteration_count[to_increment] += 1
             active_mask = new_active
 
-        # 保存用于损失计算的隐状态
-        if is_teacher_path:
-            self.z_teacher_for_loss = z.detach().clone()
-        else:
-            self.z_pred_for_loss = z.clone()
-            self.logits_span_for_loss = self.proj_head(z)
+        # 无论循环是否提前退出，均统一计算 final_logits
+        final_logits = self.proj_head(z)
 
         return {
             'seq': seq,
-            'z_pred': final_z if not is_teacher_path else None,
-            'logits_span': final_logits if not is_teacher_path else None,
-            'p_g': F.softmax(gate_logits, dim=-1) if gate_logits is not None else None,
+            'logits_span': final_logits,
             'g_hat': iteration_count  # 每个样本的实际迭代步数
         }
 
@@ -255,20 +225,6 @@ class SpanFusionLM(nn.Module):
                 K: int,
                 gold_span: torch.Tensor = None,
                 temperature: float = 1.0,
-                top_p: float = 0.9,
-                compute_teacher_latent: bool = False):
-        # Student路径
-        student_output = self.span_forward_pass(
-            seq_prompt, K,
-            temperature=temperature, top_p=top_p,
-            is_teacher_path=False
-        )
-        # Teacher路径：使用detach的决策进行辅助
-        if compute_teacher_latent:
-            with torch.no_grad():
-                _ = self.span_forward_pass(
-                    seq_prompt, K,
-                    temperature=1.0, top_p=1.0,
-                    is_teacher_path=True
-                )
-        return student_output
+                top_p: float = 0.9):
+        # 仅使用 Student 路径
+        return self.span_forward_pass(seq_prompt, K, temperature=temperature, top_p=top_p)

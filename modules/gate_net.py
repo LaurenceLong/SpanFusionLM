@@ -1,52 +1,45 @@
-# SpanFusionLM/modules/gate_net.py
+# modules/gate_net.py
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from .decoder import LlamaMLP
+
 class GateNet(nn.Module):
-    def __init__(self, input_dim=1, hidden_dim=256, g_max=8):
+    def __init__(self, input_dim=1, hidden_dim=256):
         super().__init__()
-        self.g_max = g_max  # 最大迭代步数（仅用于传递配置）
         self.hidden_dim = hidden_dim
 
         self.mlp = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
-            nn.LayerNorm(hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim, hidden_dim // 2),
-            nn.LayerNorm(hidden_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(hidden_dim // 2, 2)  # 二分类输出：0 表示停止，1 表示继续
+            LlamaMLP(hidden_dim, intermediate_size=4 * hidden_dim),
+            nn.Linear(hidden_dim, 2)  # 二分类输出：0 表示停止，1 表示继续
         )
-        self.override_fn = None
+        self._override_fn = None
 
     def override(self, override_fn):
-        """允许在推理时覆盖GateNet的行为"""
-        self.override_fn = override_fn
+        """
+        在推理时，注入一个 override_fn(entropy_tensor) -> gate_logits
+        """
+        self._override_fn = override_fn
 
     def forward(self, entropy_feature: torch.Tensor, train: bool = True):
-        """
-        entropy_feature: (B, input_dim) – 通常为平均熵 (B,1)
-        返回:
-          decision: (B,) ，0 表示提前停止，1 表示继续迭代；
-          logits: (B,2) 未归一化logits
-        """
-        if self.override_fn is not None:
-            logits = self.override_fn(entropy_feature)
-        else:
-            logits = self.mlp(entropy_feature)
+        # 如果设置了 override，就直接使用覆盖函数
+        if self._override_fn is not None:
+            gate_logits = self._override_fn(entropy_feature)
+            decision = gate_logits.argmax(dim=-1)
+            return decision, gate_logits
 
-        logits = torch.clamp(logits, min=-10, max=10)
+        logits = self.mlp(entropy_feature)
 
         if train:
-            # 使用 Gumbel Softmax 实现带硬采样的梯度传递
-            decision_one_hot = F.gumbel_softmax(logits, tau=0.5, hard=True)
+            # 混合精度下，在 fp32 下计算 Gumbel-Softmax 以确保数值稳定性
+            with torch.amp.autocast(enabled=False, device_type=logits.device.type):
+                decision_one_hot = F.gumbel_softmax(logits.float(), tau=0.5, hard=True)
+            decision_one_hot = decision_one_hot.to(logits.dtype)
         else:
             decisions = logits.argmax(dim=-1)
             decision_one_hot = F.one_hot(decisions, num_classes=2).float()
 
-        # 如果概率最大的位置索引为 1，则输出 1 表示继续，否则为 0 表示停止
         decision = decision_one_hot.argmax(dim=-1)
         return decision, logits

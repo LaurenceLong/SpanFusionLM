@@ -11,7 +11,7 @@ def generate(args):
     device = torch.device(args.device if torch.cuda.is_available() and args.device == "cuda" else "cpu")
 
     # Load tokenizer
-    tokenizer = build_tokenizer(args.model_name_or_path) # Assumes tokenizer is saved with model
+    tokenizer = build_tokenizer(args.model_name_or_path)  # Assumes tokenizer is saved with model
 
     # Load config
     config_path = Path(args.model_name_or_path) / "config.json"
@@ -59,6 +59,14 @@ def generate(args):
 
     print(f"Starting generation with K={args.K}, mode='{args.generation_mode}'...")
 
+    # 设置 GateNet 的 override 函数（仅在推理时有效）
+    if args.generation_mode == 'fast':
+        model.gate_net.override(fast_override_fn)
+    elif args.generation_mode == 'accurate':
+        model.gate_net.override(accurate_override_fn)
+    else:
+        model.gate_net.override(None)
+
     with torch.no_grad():
         while generated_tokens < args.max_new_tokens:
             current_seq_len = seq.shape[1]
@@ -66,17 +74,10 @@ def generate(args):
             if K_to_generate <= 0:
                 break
 
-            if args.generation_mode == 'fast':
-                model.gate_net.override(fast_override_fn)
-            elif args.generation_mode == 'accurate':
-                model.gate_net.override(accurate_override_fn)
-            else:
-                model.gate_net.override(None)
-
             if current_seq_len + K_to_generate > config.max_position_embeddings:
                 print(f"Warning: Sequence length {current_seq_len + K_to_generate} might exceed max_position_embeddings {config.max_position_embeddings}. Truncating K.")
                 K_to_generate = config.max_position_embeddings - current_seq_len
-                if K_to_generate <=0:
+                if K_to_generate <= 0:
                     print("Cannot generate further due to max length.")
                     break
 
@@ -85,10 +86,9 @@ def generate(args):
             out = model.span_forward_pass(
                 prompt_for_span,
                 K_to_generate,
-                g=None,
                 temperature=args.temperature,
                 top_p=args.top_p,
-                is_teacher_path=False
+                g_override=None
             )
 
             newly_generated_part = out['seq'][:, current_seq_len : current_seq_len + K_to_generate]

@@ -53,7 +53,7 @@ INCLUDE_EXTENSIONS = [
 ROOT_DIR = os.getcwd()
 
 # 文件内容提取正则表达式
-head = "#" * 3
+head = "#" * 4
 FILE_PATTERN = "\n" + head + r" (.*?)[\r\n]+[.\r\n]*```.*?\n(.*?)```"
 
 
