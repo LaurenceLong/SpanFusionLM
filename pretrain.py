@@ -1,4 +1,4 @@
-# SpanFusionLM/pretrain.py
+# pretrain.py
 import argparse
 import logging
 import math
@@ -44,11 +44,11 @@ def parse_args():
 
     # Training args
     parser.add_argument("--output_dir", type=str, default="./spanfusionlm_checkpoint", help="Output directory")
-    parser.add_argument("--learning_rate", type=float, default=1e-4, help="Learning rate")
+    parser.add_argument("--learning_rate", type=float, default=1e-5, help="Learning rate")
     parser.add_argument("--weight_decay", type=float, default=0.01, help="Weight decay")
     parser.add_argument("--adam_beta1", type=float, default=0.9, help="Adam beta1")
-    parser.add_argument("--adam_beta2", type=float, default=0.95, help="Adam beta2")
-    parser.add_argument("--grad_clip", type=float, default=0.5, help="Gradient clipping")
+    parser.add_argument("--adam_beta2", type=float, default=0.99, help="Adam beta2")
+    parser.add_argument("--grad_clip", type=float, default=1.0, help="Gradient clipping")
     parser.add_argument("--beta_cost_g", type=float, default=0.01, help="E[g] cost coefficient")
     parser.add_argument("--mixed_precision", type=str, default="fp16", help="Mixed precision")
 
@@ -117,6 +117,9 @@ def collate_fn(batch_samples, tokenizer, fixed_K_value, max_seq_len, pad_token_i
 def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accelerator):
     """计算所有损失项"""
     try:
+        # 确保训练时没有残留的override_fn
+        model.gate_net.override(None)
+
         # 前向传播
         student_out = model(
             seq_prompt,
@@ -137,7 +140,6 @@ def compute_losses(model, seq_prompt, gold_span, current_K, model_config, accele
         gold_target_ids = gold_full_seq[:, 1:]
 
         if gold_input_ids.shape[1] > 0:
-            # 简化的AR损失计算
             embeddings = unwrapped_model.token_emb(gold_input_ids)
             batch_size_ar, ar_seq_len = gold_input_ids.shape
             ar_pos_ids = torch.arange(ar_seq_len, device=accelerator.device).unsqueeze(0).expand(batch_size_ar, -1)
@@ -192,10 +194,10 @@ def main():
 
     accelerator = Accelerator(
         gradient_accumulation_steps=args.gradient_accumulation_steps,
-        mixed_precision=args.mixed_precision
+        mixed_precision=args.mixed_precision,
+        device_placement=True
     )
 
-    # 设置日志
     logging.basicConfig(
         format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
         datefmt="%m/%d/%Y %H:%M:%S",
@@ -206,10 +208,8 @@ def main():
     if accelerator.is_main_process and not args.disable_wandb:
         wandb.init(project=args.wandb_project, entity=args.wandb_entity, config=args)
 
-    # 加载tokenizer
     tokenizer = build_tokenizer(args.tokenizer_name)
 
-    # 创建模型配置
     max_k_val = max(args.span_lengths)
     config_max_pos_embeddings = args.max_seq_length + max_k_val
 
@@ -230,7 +230,6 @@ def main():
     logger.info(f"Model config: {model_config}")
     model = SpanFusionLM(model_config)
 
-    # 优化器
     optimizer = optim.AdamW(
         model.parameters(),
         lr=args.learning_rate,
@@ -239,13 +238,10 @@ def main():
         eps=1e-8
     )
 
-    # 加载数据集
     logger.info(f"Loading dataset: {args.dataset_name}")
     raw_datasets = load_dataset(args.dataset_name, args.dataset_config_name)
-
     train_dataset = raw_datasets[args.train_split]
 
-    # DataLoader包装器
     def train_collate_wrapper(batch_samples):
         current_K = random.choice(args.span_lengths)
         return collate_fn(batch_samples, tokenizer, current_K, args.max_seq_length, model_config.pad_token_id)
@@ -258,7 +254,6 @@ def main():
         drop_last=True
     )
 
-    # 学习率调度器
     if args.max_train_steps is None:
         num_update_steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
         args.max_train_steps = args.num_train_epochs * num_update_steps_per_epoch
@@ -270,7 +265,6 @@ def main():
         num_training_steps=args.max_train_steps,
     )
 
-    # Accelerator准备
     model, optimizer, train_dataloader, lr_scheduler = accelerator.prepare(
         model, optimizer, train_dataloader, lr_scheduler
     )
@@ -278,7 +272,7 @@ def main():
     logger.info("***** Running training *****")
     logger.info(f"  Total optimization steps = {args.max_train_steps}")
 
-    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process)
+    progress_bar = tqdm(range(args.max_train_steps), disable=not accelerator.is_local_main_process, dynamic_ncols=True)
     completed_steps = 0
     skip_count = 0
 
@@ -295,9 +289,7 @@ def main():
             seq_prompt, gold_span = batch_data
             current_K = gold_span.shape[1]
 
-            # 使用accelerator的accumulate上下文管理器
             with accelerator.accumulate(model):
-                # 计算损失
                 loss_result, success = compute_losses(
                     model, seq_prompt, gold_span, current_K, model_config, accelerator
                 )
@@ -310,7 +302,6 @@ def main():
 
                 losses = loss_result
 
-                # 总损失计算
                 total_loss = (
                     0.3 * losses['ar'] +
                     0.3 * losses['latent'] +
@@ -318,31 +309,25 @@ def main():
                     args.beta_cost_g * losses['exp_g']
                 )
 
-                # 检查损失有效性
-                if torch.isnan(total_loss) or torch.isinf(total_loss) or total_loss.item() > 50:
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
                     skip_count += 1
                     logger.warning(f"Invalid loss detected: {total_loss}, skipping step")
                     continue
 
-                # 反向传播
                 accelerator.backward(total_loss)
 
-                # 只有在accumulate步骤完成时才进行优化步骤
                 if accelerator.sync_gradients:
-                    # 梯度裁剪
                     if args.grad_clip > 0:
                         accelerator.clip_grad_norm_(model.parameters(), args.grad_clip)
 
-                    # 优化器步骤
                     optimizer.step()
                     lr_scheduler.step()
                     optimizer.zero_grad()
 
-                    # 更新计数器
                     completed_steps += 1
                     progress_bar.update(1)
+                    progress_bar.set_postfix(loss=f"{total_loss.item():.4f}")
 
-                    # 日志记录
                     if completed_steps % args.logging_steps == 0:
                         loss_log = {
                             "train_loss": total_loss.item(),
@@ -356,10 +341,9 @@ def main():
                         }
 
                         if accelerator.is_main_process and not args.disable_wandb:
-                            wandb.log(loss_log)
+                            wandb.log(loss_log, step=completed_steps)
                         logger.info(f"Step {completed_steps}: Loss={total_loss.item():.4f}, AR={losses['ar'].item():.4f}, Token={losses['token'].item():.4f}")
 
-                    # 保存检查点
                     if completed_steps % args.save_steps == 0:
                         if accelerator.is_main_process:
                             save_path = Path(args.output_dir) / f"checkpoint-{completed_steps}"
@@ -374,7 +358,6 @@ def main():
             if completed_steps >= args.max_train_steps:
                 break
 
-    # 最终保存
     if accelerator.is_main_process:
         final_save_path = Path(args.output_dir) / "final_checkpoint"
         final_save_path.mkdir(parents=True, exist_ok=True)
@@ -390,4 +373,5 @@ def main():
     logger.info(f"Training complete. Total skipped steps: {skip_count}")
 
 if __name__ == "__main__":
+    torch.autograd.set_detect_anomaly(True)
     main()

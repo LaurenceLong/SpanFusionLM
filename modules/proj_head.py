@@ -1,7 +1,6 @@
-# SpanFusionLM/modules/proj_head.py
+# modules/proj_head.py
 import torch
 import torch.nn as nn
-
 
 class ProjectionHead(nn.Module):
     def __init__(self, hidden_size, vocab_size, tied_embedding_weight=None):
@@ -11,9 +10,8 @@ class ProjectionHead(nn.Module):
 
         if tied_embedding_weight is not None:
             # 使用共享的权重
-            self.decoder_weight = tied_embedding_weight  # 共享token_embedding.weight
+            self.decoder_weight = tied_embedding_weight  # 共享 token_embedding.weight
         else:
-            # 若不共享则初始化一份新的权重
             self.decoder_weight = nn.Parameter(torch.empty(vocab_size, hidden_size))
             nn.init.xavier_uniform_(self.decoder_weight)
 
@@ -24,12 +22,8 @@ class ProjectionHead(nn.Module):
         """
         # 先进行 layer norm 归一化
         x_norm = self.layer_norm(x)
-        # 对归一化的结果进行 clamping，防止出现极端值
-        x_norm = torch.clamp(x_norm, min=-1e6, max=1e6)
-        # 计算 logits，即矩阵相乘（使用共享权重的转置）
+        # 直接进行矩阵乘法，不做过度 clamp
         logits = torch.matmul(x_norm, self.decoder_weight.t())
-        # 对 logits 同样进行 clamping
-        logits = torch.clamp(logits, min=-1e6, max=1e6)
-        # 将潜在的 NaN 值替换为 0，并将正无穷、负无穷换为有限值，保证后续 log_softmax 不会出现 NaN
+        # 将潜在的 NaN 值替换为 0，并将正无穷、负无穷换为有限值
         logits = torch.nan_to_num(logits, nan=0.0, posinf=1e6, neginf=-1e6)
         return logits

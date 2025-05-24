@@ -20,7 +20,7 @@ def build_tokenizer(tokenizer_name_or_path="gpt2", **kwargs):
         'bos_token': '<BOS>',
         'eos_token': '<EOS>',
         'pad_token': '<PAD>',
-        'additional_special_tokens': ['[PRED]'] # For span filling
+        'additional_special_tokens': ['<|PRED|>'] # For span filling
     }
     
     # Check existing special tokens and add if not present or different
@@ -54,11 +54,11 @@ def build_tokenizer(tokenizer_name_or_path="gpt2", **kwargs):
         setattr(tokenizer, "__len__", lambda: tokenizer.vocab_size)
         
     # Store PRED token ID for convenience if needed, though config should handle it
-    # pred_token_str = '[PRED]'
+    # pred_token_str = '<|PRED|>'
     # if pred_token_str in tokenizer.additional_special_tokens:
     #     tokenizer.pred_token_id = tokenizer.convert_tokens_to_ids(pred_token_str)
     # else:
-    #     # This case means [PRED] wasn't added or found, which is an issue.
+    #     # This case means <|PRED|> wasn't added or found, which is an issue.
     #     # The config's __post_init__ will handle getting the ID.
     #     pass
 

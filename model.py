@@ -1,4 +1,4 @@
-# SpanFusionLM/model.py
+# model.py
 from dataclasses import dataclass, field
 import json
 from pathlib import Path
@@ -73,9 +73,9 @@ class SpanFusionLMConfig:
         if self.vocab_size is None or self.vocab_size == 32000:
             self.vocab_size = len(self.tokenizer)
 
-        if hasattr(self.tokenizer, 'additional_special_tokens') and '[PRED]' in self.tokenizer.additional_special_tokens:
+        if hasattr(self.tokenizer, 'additional_special_tokens') and '<|PRED|>' in self.tokenizer.additional_special_tokens:
             self.pred_token_id = self.tokenizer.additional_special_tokens_ids[
-                self.tokenizer.additional_special_tokens.index('[PRED]')
+                self.tokenizer.additional_special_tokens.index('<|PRED|>')
             ]
 
         self.pad_token_id = self.tokenizer.pad_token_id
@@ -171,6 +171,10 @@ class SpanFusionLM(nn.Module):
         B, n_prompt = seq_prompt.shape
         device = seq_prompt.device
 
+        # 确保训练时不保留之前的 override_fn
+        if self.training:
+            self.gate_net.override(None)
+
         if K == 0:
             return {'seq': seq_prompt, 'z_pred': None, 'logits_span': None, 'p_g': None}
 
@@ -178,33 +182,29 @@ class SpanFusionLM(nn.Module):
         pred_tokens = torch.full((B, K), self.config.pred_token_id, dtype=torch.long, device=device)
         seq = torch.cat([seq_prompt, pred_tokens], dim=1)
 
-        # 2. 初始decoder前向
+        # 初始decoder前向
         embeddings = self.token_emb(seq)
         position_ids = torch.arange(n_prompt + K, device=device).unsqueeze(0).expand(B, -1)
-
         h_dec, _ = self.decoder(
             hidden_states=embeddings,
             position_ids=position_ids,
             past_key_values=None,
-            use_cache=False  # 简化：不使用KV缓存
+            use_cache=False
         )
-
-        # 3. 计算初始熵
         h_pred_positions = h_dec[:, n_prompt:, :]
         logits_pred = self.proj_head(h_pred_positions)
         entropy = self._calc_entropy(logits_pred)
 
-        # 4. GateNet预测步数
+        # 2. GateNet预测步数
         if g is not None:
             g_hat = torch.full((B,), g, dtype=torch.long, device=device)
             gate_logits = None
         else:
             mean_entropy = entropy.mean(dim=-1, keepdim=True)
             g_hat, gate_logits = self.gate_net(mean_entropy, train=self.training and not is_teacher_path)
-
         g_loop = g_hat.max().item() if g_hat.numel() > 0 else 0
 
-        # 5. 简化的refinement过程
+        # 3. 简化的refinement过程
         z = self.token_emb(pred_tokens)
         filled_mask = torch.zeros(B, K, dtype=torch.bool, device=device)
 
@@ -212,6 +212,19 @@ class SpanFusionLM(nn.Module):
             active_mask = g_hat > t
             if not active_mask.any():
                 break
+
+            # 重新计算当前步的h_pred_positions和熵（更新后的seq影响decoder输出）
+            embeddings = self.token_emb(seq)
+            position_ids = torch.arange(seq.shape[1], device=device).unsqueeze(0).expand(B, -1)
+            h_dec, _ = self.decoder(
+                hidden_states=embeddings,
+                position_ids=position_ids,
+                past_key_values=None,
+                use_cache=False
+            )
+            h_pred_positions = h_dec[:, n_prompt:, :]
+            logits_pred = self.proj_head(h_pred_positions)
+            entropy = self._calc_entropy(logits_pred)
 
             # 计算当前步的填充数量
             g_active = g_hat[active_mask].float()
@@ -225,19 +238,19 @@ class SpanFusionLM(nn.Module):
             # Encoder refinement
             z = self.encoder.step(z, h_pred_positions.detach(), n_prompt)
 
-            # 投射并采样
+            # 投射并采样更新token
             if pick_mask.any():
                 z_picked = z[pick_mask]
                 logits_picked = self.proj_head(z_picked) / temperature
-
                 if is_teacher_path:
                     tokens_picked = torch.argmax(logits_picked, dim=-1)
                 else:
                     tokens_picked = sample_from_logits(logits_picked, temperature, top_p)
-
-                # 更新序列
+                # 避免inplace修改：先clone再更新对应位置
                 seq_new = seq.clone()
-                seq_new[:, n_prompt:][pick_mask] = tokens_picked
+                seq_seg = seq_new[:, n_prompt:]
+                seq_seg[pick_mask] = tokens_picked
+                seq_new[:, n_prompt:] = seq_seg
                 seq = seq_new
                 filled_mask = filled_mask | pick_mask
 
@@ -248,11 +261,6 @@ class SpanFusionLM(nn.Module):
                 else:
                     self.z_pred_for_loss = z.clone()
                     self.logits_span_for_loss = self.proj_head(z)
-
-        # 确保损失变量被设置
-        if not is_teacher_path and self.z_pred_for_loss is None:
-            self.z_pred_for_loss = z.clone()
-            self.logits_span_for_loss = self.proj_head(z)
 
         return {
             'seq': seq,
