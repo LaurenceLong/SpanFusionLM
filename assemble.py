@@ -32,9 +32,10 @@ EXCLUDE_FILES = {
 }
 
 INCLUDE_FILES = {
-    # 'gate_net.py',
-    # 'model.py',
-    # 'pretrain.py',
+    'decoder.py',
+    'encoder.py',
+    'model.py',
+    'pretrain.py',
 }
 
 # 要包含的文件扩展名 (如果列表不为空，则只包含这些扩展名的文件)

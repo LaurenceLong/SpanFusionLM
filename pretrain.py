@@ -182,7 +182,7 @@ def main():
         train_dataset,
         batch_size=args.batch_size_per_device,
         shuffle=True,
-        collate_fn=lambda batch: training_collate_fn(batch, model_config.pad_token_id),
+        collate_fn=lambda b: training_collate_fn(b, model_config.pad_token_id),
         drop_last=True,
         num_workers=args.num_workers
     )
@@ -216,8 +216,8 @@ def main():
             if batch is None:
                 continue
 
-            # batch 已由 training_collate_fn 处理，返回 (padded_prompts, padded_spans, current_K)
-            padded_seq_prompts, padded_gold_spans, current_K = batch
+            # batch 已由 training_collate_fn 处理，返回 (padded_prompts, padded_spans)
+            padded_seq_prompts, padded_gold_spans = batch
 
             with accelerator.accumulate(model):
                 losses, output = compute_losses(

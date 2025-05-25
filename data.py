@@ -158,7 +158,7 @@ def load_preprocessed_dataset(args, tokenizer, chunk_size=5000, data_dir=os.getc
     shard_files = sorted(glob.glob(pattern, root_dir=data_dir))
     if shard_files:
         shard_lengths = []
-        logger.info("Found %d shard files.", len(shard_files))
+        logger.info(f"Found %d shard files in {data_dir}.", len(shard_files))
         # 对每个分片文件加载后统计实例数量
         for sf in shard_files:
             try:
@@ -179,7 +179,7 @@ def load_preprocessed_dataset(args, tokenizer, chunk_size=5000, data_dir=os.getc
 def training_collate_fn(batch, pad_token_id):
     """
     对 batch 内的实例进行 collate。
-    每个实例为 dict {"prompt": list, "span": list, "K": fixed_K_value}。
+    每个实例为 dict {"prompt": list, "span": list}。
     对 prompt 序列进行 pad（span 长度固定，可直接 stack）。
     为确保进入模型时 span 长度一致，以第一个实例的 K 为准，仅保留 K 值匹配的样本，
     并输出 warning 提示过滤掉的样本数。
@@ -189,13 +189,8 @@ def training_collate_fn(batch, pad_token_id):
         return None
 
     # 以第一个样本的 K 为基准（这里所有实例均应使用相同的 fixed_K）
-    current_K = batch[0]["K"]
-    filtered_batch = [item for item in batch if item["K"] == current_K]
-    num_dropped = len(batch) - len(filtered_batch)
-    if num_dropped > 0:
-        logger.warning("Dropped %d samples with mismatched K (expected %d) in current batch.", num_dropped, current_K)
-    prompts = [torch.tensor(item["prompt"], dtype=torch.long) for item in filtered_batch]
-    spans = [torch.tensor(item["span"], dtype=torch.long) for item in filtered_batch]
+    prompts = [torch.tensor(item["prompt"], dtype=torch.long) for item in batch]
+    spans = [torch.tensor(item["span"], dtype=torch.long) for item in batch]
     padded_prompts = pad_sequence(prompts, batch_first=True, padding_value=pad_token_id)
-    padded_spans = torch.stack(spans)  # 此处所有 span 长度均应为 current_K
-    return padded_prompts, padded_spans, current_K
+    padded_spans = pad_sequence(spans, batch_first=True, padding_value=pad_token_id)
+    return padded_prompts, padded_spans
